@@ -1,6 +1,7 @@
 import { PrismaClient } from '@prisma/client';
 import bcrypt from 'bcryptjs';
 import { randomInviteCode } from '../src/lib/inviteCode';
+import { createDefaultRoles, ensureProjectMember } from '../src/lib/permissions';
 
 const prisma = new PrismaClient();
 
@@ -76,6 +77,10 @@ async function main() {
     where: { projectId: project.id },
     orderBy: { order: 'asc' },
   });
+
+  await createDefaultRoles(project.id);
+  await ensureProjectMember(project.id, admin.id);
+  await ensureProjectMember(project.id, user.id);
 
   await prisma.task.upsert({
     where: { id: 'seed-task' },

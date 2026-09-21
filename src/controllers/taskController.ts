@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { prisma } from '../lib/prisma';
 import { sendError } from '../lib/errors';
 import { assigneesInclude, columnSelect, createdBySelect, uniqIds, watchersInclude, withAssignees, withWatchers } from '../lib/taskAssignees';
+import { can } from '../lib/permissions';
 
 export async function getTask(req: Request, res: Response) {
   const task = await prisma.task.findUnique({
@@ -71,6 +72,11 @@ export async function updateTask(req: Request, res: Response) {
   if (columnId && before.approval !== 'APPROVED' && columnId !== before.columnId) {
     return sendError(res, 422, 'Task belum disetujui admin sehingga belum bisa dipindah');
   }
+  if (columnId && columnId !== before.columnId && checked.membership.role !== 'ADMIN') {
+    if (!(await can(req.userId, before.projectId, 'task.move'))) {
+      return sendError(res, 403, 'Role kamu tidak boleh memindah task');
+    }
+  }
   // Task yang ditolak hanya boleh diubah admin (kreator tak terlacak di model).
   if (before.approval === 'REJECTED' && checked.membership.role !== 'ADMIN') {
     return sendError(res, 403, 'Task yang ditolak hanya bisa diubah admin');
@@ -127,7 +133,12 @@ export async function deleteTask(req: Request, res: Response) {
         ? sendError(res, 401, 'Tidak terautentikasi')
         : sendError(res, 403, 'Bukan anggota tim ini');
   }
-  if (checked.membership.role !== 'ADMIN') return sendError(res, 403, 'Hanya admin tim yang bisa menghapus task');
+  if (checked.membership.role !== 'ADMIN') {
+    const task = await prisma.task.findUnique({ where: { id: req.params.taskId }, select: { projectId: true } });
+    if (!task || !(await can(req.userId, task.projectId, 'task.delete'))) {
+      return sendError(res, 403, 'Hanya yang berhak yang bisa menghapus task');
+    }
+  }
   await prisma.task.delete({ where: { id: req.params.taskId } });
   return res.json({ success: true, data: { id: req.params.taskId } });
 }
@@ -342,7 +353,7 @@ export async function removeWatcher(req: Request, res: Response) {
   return res.json({ success: true, data: { userId: req.params.userId } });
 }
 
-// Setujui/tolak usulan task — khusus admin tim.
+// Setujui/tolak usulan task — butuh izin task.approve (role Approver ke atas).
 async function decideApproval(req: Request, res: Response, approval: 'APPROVED' | 'REJECTED') {
   const checked = await requireTaskMembership(req.params.taskId, req.userId);
   if ('error' in checked) {
@@ -352,7 +363,12 @@ async function decideApproval(req: Request, res: Response, approval: 'APPROVED' 
         ? sendError(res, 401, 'Tidak terautentikasi')
         : sendError(res, 403, 'Bukan anggota tim ini');
   }
-  if (checked.membership.role !== 'ADMIN') return sendError(res, 403, 'Hanya admin tim yang bisa menyetujui task');
+  if (checked.membership.role !== 'ADMIN') {
+    const task = await prisma.task.findUnique({ where: { id: req.params.taskId }, select: { projectId: true } });
+    if (!task || !(await can(req.userId, task.projectId, 'task.approve'))) {
+      return sendError(res, 403, 'Hanya approver yang bisa menyetujui task');
+    }
+  }
   const task = await prisma.task.update({
     where: { id: req.params.taskId },
     data: { approval },

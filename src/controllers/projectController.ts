@@ -4,6 +4,12 @@ import { prisma } from '../lib/prisma';
 import { sendError } from '../lib/errors';
 import { AVATAR_RE, avatarUrlField } from '../lib/avatar';
 import { assigneesInclude, columnSelect, createdBySelect, uniqIds, watchersInclude, withAssignees, withWatchers } from '../lib/taskAssignees';
+import { can, ensureProjectMember, PERMISSIONS } from '../lib/permissions';
+import type { PermissionKey } from '../lib/permissions';
+
+function isUniqueConflict(e: unknown) {
+  return (e as { code?: string })?.code === 'P2002';
+}
 
 export async function getProject(req: Request, res: Response) {
   const project = await prisma.project.findUnique({
@@ -45,7 +51,9 @@ export async function updateProject(req: Request, res: Response) {
         ? sendError(res, 401, 'Tidak terautentikasi')
         : sendError(res, 403, 'Bukan anggota tim ini');
   }
-  if (checked.membership.role !== 'ADMIN') return sendError(res, 403, 'Hanya admin tim yang bisa mengelola project');
+  if (checked.membership.role !== 'ADMIN' && !(await can(req.userId, req.params.projectId, 'project.manage'))) {
+    return sendError(res, 403, 'Hanya admin tim yang bisa mengelola project');
+  }
   const project = await prisma.project.update({
     where: { id: req.params.projectId },
     data: { ...body },
@@ -62,7 +70,9 @@ export async function deleteProject(req: Request, res: Response) {
         ? sendError(res, 401, 'Tidak terautentikasi')
         : sendError(res, 403, 'Bukan anggota tim ini');
   }
-  if (checked.membership.role !== 'ADMIN') return sendError(res, 403, 'Hanya admin tim yang bisa menghapus');
+  if (checked.membership.role !== 'ADMIN' && !(await can(req.userId, req.params.projectId, 'project.manage'))) {
+    return sendError(res, 403, 'Hanya admin tim yang bisa menghapus');
+  }
   await prisma.project.delete({ where: { id: req.params.projectId } });
   return res.json({ success: true, data: { id: req.params.projectId } });
 }
@@ -160,8 +170,11 @@ export async function createTask(req: Request, res: Response) {
         : sendError(res, 403, 'Bukan anggota tim ini');
   }
 
-  // Anggota boleh mengusul; task anggota berstatus PENDING sampai disetujui admin.
-  const approval = checked.membership.role === 'ADMIN' ? 'APPROVED' : 'PENDING';
+  // Anggota boleh mengusul; langsung APPROVED bila punya izin approve.
+  const approval =
+    checked.membership.role === 'ADMIN' || (await can(req.userId, req.params.projectId, 'task.approve'))
+      ? 'APPROVED'
+      : 'PENDING';
 
   // Kolom tujuan: yang diminta (harus se-project) atau kolom pertama.
   let columnId = body.columnId ?? null;
@@ -214,17 +227,26 @@ export async function createTask(req: Request, res: Response) {
       })),
     });
   }
-  // Usulan anggota: beri tahu semua admin tim agar segera direview.
+  // Usulan anggota: beri tahu semua yang bisa approve di project ini.
   if (approval === 'PENDING' && req.userId) {
     const proposer = await prisma.user.findUnique({
       where: { id: req.userId },
       select: { name: true },
     });
-    const admins = await prisma.teamMember.findMany({
+    const teamAdmins = await prisma.teamMember.findMany({
       where: { teamId: checked.project.teamId, role: 'ADMIN' },
       select: { userId: true },
     });
-    const targets = [...new Set(admins.map((a) => a.userId))].filter((id) => id !== req.userId);
+    const roleApprovers = await prisma.projectMember.findMany({
+      where: { projectId: req.params.projectId },
+      select: { userId: true, role: { select: { permissions: true } } },
+    });
+    const targets = [
+      ...new Set([
+        ...teamAdmins.map((a) => a.userId),
+        ...roleApprovers.filter((m) => m.role.permissions.includes('task.approve')).map((m) => m.userId),
+      ]),
+    ].filter((id) => id !== req.userId);
     if (targets.length > 0) {
       await prisma.notification.createMany({
         data: targets.map((userId) => ({
@@ -242,11 +264,12 @@ export async function createTask(req: Request, res: Response) {
 
 // ===== Kolom kanban bebas (F-04 ala Taiga) =====
 
-async function requireAdmin(projectId: string, userId?: string) {
+async function requirePerm(projectId: string, userId: string | undefined, perm: PermissionKey) {
   const checked = await requireMembership(projectId, userId);
   if ('error' in checked) return checked;
-  if (checked.membership.role !== 'ADMIN') return { error: 403 as const, admin: true as const };
-  return checked;
+  if (checked.membership.role === 'ADMIN') return checked;
+  if (await can(userId, projectId, perm)) return checked;
+  return { error: 403 as const, admin: true as const };
 }
 
 function adminError(res: Response, checked: { error?: number; admin?: boolean }) {
@@ -278,7 +301,7 @@ const createColumnSchema = z.object({ name: z.string().trim().min(1).max(30) });
 
 export async function createColumn(req: Request, res: Response) {
   const body = createColumnSchema.parse(req.body);
-  const checked = await requireAdmin(req.params.projectId, req.userId);
+  const checked = await requirePerm(req.params.projectId, req.userId, 'column.manage');
   if ('error' in checked) return adminError(res, checked);
   const last = await prisma.boardColumn.findFirst({
     where: { projectId: req.params.projectId },
@@ -303,7 +326,7 @@ const updateColumnSchema = z
 
 export async function updateColumn(req: Request, res: Response) {
   const body = updateColumnSchema.parse(req.body);
-  const checked = await requireAdmin(req.params.projectId, req.userId);
+  const checked = await requirePerm(req.params.projectId, req.userId, 'column.manage');
   if ('error' in checked) return adminError(res, checked);
   const column = await prisma.boardColumn
     .update({ where: { id: req.params.columnId }, data: { ...body } })
@@ -318,7 +341,7 @@ const reorderColumnsSchema = z.object({ orderedIds: z.array(z.string()).min(1) }
 
 export async function reorderColumns(req: Request, res: Response) {
   const body = reorderColumnsSchema.parse(req.body);
-  const checked = await requireAdmin(req.params.projectId, req.userId);
+  const checked = await requirePerm(req.params.projectId, req.userId, 'column.manage');
   if ('error' in checked) return adminError(res, checked);
   const count = await prisma.boardColumn.count({
     where: { id: { in: body.orderedIds }, projectId: req.params.projectId },
@@ -334,7 +357,7 @@ const deleteColumnSchema = z.object({ targetColumnId: z.string().min(1).optional
 
 export async function deleteColumn(req: Request, res: Response) {
   const body = deleteColumnSchema.parse(req.body);
-  const checked = await requireAdmin(req.params.projectId, req.userId);
+  const checked = await requirePerm(req.params.projectId, req.userId, 'column.manage');
   if ('error' in checked) return adminError(res, checked);
   const column = await prisma.boardColumn.findFirst({
     where: { id: req.params.columnId, projectId: req.params.projectId },
@@ -373,4 +396,165 @@ export async function deleteColumn(req: Request, res: Response) {
   }
   await prisma.boardColumn.delete({ where: { id: column.id } });
   return res.json({ success: true, data: { id: column.id, movedCount: 0 } });
+}
+
+// ===== Role custom per project =====
+
+async function requireRoleManage(projectId: string, userId: string | undefined) {
+  const checked = await requireMembership(projectId, userId);
+  if ('error' in checked) return checked;
+  if (checked.membership.role === 'ADMIN') return checked;
+  if (await can(userId, projectId, 'role.manage')) return checked;
+  return { error: 403 as const, admin: true as const };
+}
+
+function roleError(res: Response, checked: { error?: number; admin?: boolean }) {
+  if (checked.admin) return sendError(res, 403, 'Hanya yang berhak mengelola role yang bisa mengatur role');
+  return checked.error === 404
+    ? sendError(res, 404, 'Proyek tidak ditemukan')
+    : checked.error === 401
+      ? sendError(res, 401, 'Tidak terautentikasi')
+      : sendError(res, 403, 'Bukan anggota tim ini');
+}
+
+export async function listRoles(req: Request, res: Response) {
+  const checked = await requireMembership(req.params.projectId, req.userId);
+  if ('error' in checked) {
+    return checked.error === 404
+      ? sendError(res, 404, 'Proyek tidak ditemukan')
+      : checked.error === 401
+        ? sendError(res, 401, 'Tidak terautentikasi')
+        : sendError(res, 403, 'Bukan anggota tim ini');
+  }
+  const roles = await prisma.projectRole.findMany({
+    where: { projectId: req.params.projectId },
+    orderBy: { createdAt: 'asc' },
+    include: { _count: { select: { members: true } } },
+  });
+  return res.json({ success: true, data: roles });
+}
+
+const roleSchema = z.object({
+  name: z.string().trim().min(1).max(30),
+  permissions: z.array(z.enum(PERMISSIONS)).default([]),
+});
+
+export async function createRole(req: Request, res: Response) {
+  const body = roleSchema.parse(req.body);
+  const checked = await requireRoleManage(req.params.projectId, req.userId);
+  if ('error' in checked) return roleError(res, checked);
+  try {
+    const role = await prisma.projectRole.create({
+      data: { projectId: req.params.projectId, name: body.name, permissions: body.permissions },
+    });
+    return res.status(201).json({ success: true, data: role });
+  } catch (e: unknown) {
+    if (isUniqueConflict(e)) return sendError(res, 409, 'Nama role sudah dipakai di project ini.');
+    throw e;
+  }
+}
+
+const updateRoleSchema = z.object({
+  name: z.string().trim().min(1).max(30).optional(),
+  permissions: z.array(z.enum(PERMISSIONS)).optional(),
+});
+
+export async function updateRole(req: Request, res: Response) {
+  const body = updateRoleSchema.parse(req.body);
+  const checked = await requireRoleManage(req.params.projectId, req.userId);
+  if ('error' in checked) return roleError(res, checked);
+  const existing = await prisma.projectRole.findFirst({
+    where: { id: req.params.roleId, projectId: req.params.projectId },
+  });
+  if (!existing) return sendError(res, 404, 'Role tidak ditemukan');
+  if (existing.system) return sendError(res, 422, 'Role bawaan tidak bisa diubah. Buat role baru bila perlu beda.');
+  try {
+    const role = await prisma.projectRole.update({
+      where: { id: existing.id },
+      data: { ...body },
+    });
+    return res.json({ success: true, data: role });
+  } catch (e: unknown) {
+    if (isUniqueConflict(e)) return sendError(res, 409, 'Nama role sudah dipakai di project ini.');
+    throw e;
+  }
+}
+
+const deleteRoleSchema = z.object({ targetRoleId: z.string().min(1).optional() });
+
+export async function deleteRole(req: Request, res: Response) {
+  const body = deleteRoleSchema.parse(req.body);
+  const checked = await requireRoleManage(req.params.projectId, req.userId);
+  if ('error' in checked) return roleError(res, checked);
+  const role = await prisma.projectRole.findFirst({
+    where: { id: req.params.roleId, projectId: req.params.projectId },
+  });
+  if (!role) return sendError(res, 404, 'Role tidak ditemukan');
+  if (role.system) return sendError(res, 422, 'Role bawaan tidak bisa dihapus.');
+  const assigned = await prisma.projectMember.count({ where: { roleId: role.id } });
+  if (assigned > 0) {
+    if (!body.targetRoleId || body.targetRoleId === role.id) {
+      return sendError(res, 422, `Role dipakai ${assigned} anggota. Pilih role pengganti.`);
+    }
+    const target = await prisma.projectRole.findFirst({
+      where: { id: body.targetRoleId, projectId: req.params.projectId },
+    });
+    if (!target) return sendError(res, 422, 'Role pengganti tidak valid');
+    await prisma.$transaction([
+      prisma.projectMember.updateMany({ where: { roleId: role.id }, data: { roleId: target.id } }),
+      prisma.projectRole.delete({ where: { id: role.id } }),
+    ]);
+    return res.json({ success: true, data: { id: role.id, movedCount: assigned } });
+  }
+  await prisma.projectRole.delete({ where: { id: role.id } });
+  return res.json({ success: true, data: { id: role.id, movedCount: 0 } });
+}
+
+const memberSelect = { id: true, name: true, email: true, avatarUrl: true } as const;
+
+export async function listProjectMembers(req: Request, res: Response) {
+  const checked = await requireMembership(req.params.projectId, req.userId);
+  if ('error' in checked) {
+    return checked.error === 404
+      ? sendError(res, 404, 'Proyek tidak ditemukan')
+      : checked.error === 401
+        ? sendError(res, 401, 'Tidak terautentikasi')
+        : sendError(res, 403, 'Bukan anggota tim ini');
+  }
+  // Pastikan semua anggota tim punya baris jabatan (malas, idempoten).
+  const teamMembers = await prisma.teamMember.findMany({
+    where: { teamId: checked.project.teamId },
+    select: { userId: true },
+  });
+  for (const m of teamMembers) {
+    await ensureProjectMember(req.params.projectId, m.userId);
+  }
+  const members = await prisma.projectMember.findMany({
+    where: { projectId: req.params.projectId },
+    include: { user: { select: memberSelect }, role: true },
+    orderBy: { createdAt: 'asc' },
+  });
+  return res.json({ success: true, data: members });
+}
+
+const setMemberRoleSchema = z.object({ roleId: z.string().min(1) });
+
+export async function setMemberRole(req: Request, res: Response) {
+  const body = setMemberRoleSchema.parse(req.body);
+  const checked = await requireRoleManage(req.params.projectId, req.userId);
+  if ('error' in checked) return roleError(res, checked);
+  const role = await prisma.projectRole.findFirst({
+    where: { id: body.roleId, projectId: req.params.projectId },
+  });
+  if (!role) return sendError(res, 422, 'Role tidak valid');
+  const member = await prisma.projectMember.findFirst({
+    where: { projectId: req.params.projectId, userId: req.params.userId },
+  });
+  if (!member) return sendError(res, 404, 'Anggota tidak ditemukan di project ini');
+  const updated = await prisma.projectMember.update({
+    where: { id: member.id },
+    data: { roleId: role.id },
+    include: { user: { select: memberSelect }, role: true },
+  });
+  return res.json({ success: true, data: updated });
 }

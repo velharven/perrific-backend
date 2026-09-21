@@ -5,6 +5,7 @@ import { sendError } from '../lib/errors';
 import { AVATAR_RE, avatarUrlField } from '../lib/avatar';
 import { randomInviteCode } from '../lib/inviteCode';
 import { assigneesInclude, columnSelect, createdBySelect, withAssignees } from '../lib/taskAssignees';
+import { canAny, createDefaultRoles, ensureProjectMember } from '../lib/permissions';
 
 const createTeamSchema = z.object({ name: z.string().min(1), description: z.string().optional() });
 
@@ -198,9 +199,10 @@ export async function listJoinRequests(req: Request, res: Response) {
   const teamId = req.params.teamId;
   const membership = await prisma.teamMember.findFirst({ where: { teamId, userId: req.userId } });
   if (!membership) return sendError(res, 403, 'Bukan anggota tim ini');
-  if (membership.role !== 'ADMIN') return sendError(res, 403, 'Hanya admin tim yang bisa melihat permintaan bergabung');
-  const raw = String(req.query.status ?? 'PENDING').toUpperCase();
-  const status = raw === 'APPROVED' || raw === 'REJECTED' ? raw : 'PENDING';
+  if (membership.role !== 'ADMIN' && !(await canAny(req.userId, teamId, 'member.approve'))) {
+    return sendError(res, 403, 'Hanya approver yang bisa melihat permintaan bergabung');
+  }
+  const raw = String(req.query.status ?? 'PENDING').toUpperCase();  const status = raw === 'APPROVED' || raw === 'REJECTED' ? raw : 'PENDING';
   const items = await prisma.teamJoinRequest.findMany({
     where: { teamId, status: status as 'PENDING' | 'APPROVED' | 'REJECTED' },
     orderBy: { createdAt: 'asc' },
@@ -209,13 +211,15 @@ export async function listJoinRequests(req: Request, res: Response) {
   return res.json({ success: true, data: items });
 }
 
-// Setujui/tolak permintaan bergabung — khusus ADMIN.
+// Setujui/tolak permintaan bergabung — butuh izin member.approve.
 async function decideJoinRequest(req: Request, res: Response, status: 'APPROVED' | 'REJECTED') {
   if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
   const { teamId, requestId } = req.params;
   const membership = await prisma.teamMember.findFirst({ where: { teamId, userId: req.userId } });
   if (!membership) return sendError(res, 403, 'Bukan anggota tim ini');
-  if (membership.role !== 'ADMIN') return sendError(res, 403, 'Hanya admin tim yang bisa menyetujui anggota');
+  if (membership.role !== 'ADMIN' && !(await canAny(req.userId, teamId, 'member.approve'))) {
+    return sendError(res, 403, 'Hanya approver yang bisa menyetujui anggota');
+  }
   const jr = await prisma.teamJoinRequest.findUnique({
     where: { id: requestId },
     include: { team: { select: { id: true, name: true } }, user: { select: joinRequestUserSelect } },
@@ -228,6 +232,11 @@ async function decideJoinRequest(req: Request, res: Response, status: 'APPROVED'
     } catch (e: unknown) {
       // Balapan dua admin menyetujui bersamaan: anggap sudah anggota.
       if (!isUniqueConflict(e)) throw e;
+    }
+    // Anggota baru langsung dapat jabatan Member di semua project tim.
+    const projects = await prisma.project.findMany({ where: { teamId }, select: { id: true } });
+    for (const p of projects) {
+      await ensureProjectMember(p.id, jr.userId);
     }
   }
   const updated = await prisma.teamJoinRequest.update({
@@ -263,7 +272,9 @@ export async function listPendingTasks(req: Request, res: Response) {
   const teamId = req.params.teamId;
   const membership = await prisma.teamMember.findFirst({ where: { teamId, userId: req.userId } });
   if (!membership) return sendError(res, 403, 'Bukan anggota tim ini');
-  if (membership.role !== 'ADMIN') return sendError(res, 403, 'Hanya admin tim yang bisa melihat persetujuan task');
+  if (membership.role !== 'ADMIN' && !(await canAny(req.userId, teamId, 'task.approve'))) {
+    return sendError(res, 403, 'Hanya approver yang bisa melihat persetujuan task');
+  }
   const tasks = await prisma.task.findMany({
     where: { project: { teamId }, approval: 'PENDING' },
     orderBy: { createdAt: 'asc' },
@@ -287,6 +298,11 @@ export async function addMember(req: Request, res: Response) {
   const member = await prisma.teamMember.create({
     data: { teamId, userId: user.id, role: body.role },
   });
+  // Anggota baru langsung dapat jabatan Member di semua project tim.
+  const projects = await prisma.project.findMany({ where: { teamId }, select: { id: true } });
+  for (const p of projects) {
+    await ensureProjectMember(p.id, user.id);
+  }
   return res.status(201).json({ success: true, data: member });
 }
 
@@ -333,6 +349,8 @@ const createProjectSchema = z.object({
   name: z.string().trim().min(1).max(60),
   description: z.string().max(500).optional(),
   avatarUrl: avatarUrlField,
+  sourceProjectId: z.string().min(1).optional(),
+  memberUserIds: z.array(z.string().min(1)).optional(),
 });
 
 export async function createProject(req: Request, res: Response) {
@@ -347,20 +365,88 @@ export async function createProject(req: Request, res: Response) {
   if (body.avatarUrl !== undefined && body.avatarUrl !== null && !AVATAR_RE.test(body.avatarUrl)) {
     return sendError(res, 422, 'URL avatar tidak valid');
   }
+  const members = await prisma.teamMember.findMany({ where: { teamId }, select: { userId: true } });
+  const memberIds = new Set(members.map((m) => m.userId));
+  let source: { id: string } | null = null;
+  if (body.sourceProjectId) {
+    const found = await prisma.project.findFirst({
+      where: { id: body.sourceProjectId, teamId },
+      select: { id: true },
+    });
+    if (!found) return sendError(res, 422, 'Project sumber tidak valid');
+    source = found;
+  }
+  if (body.memberUserIds) {
+    const unknown = body.memberUserIds.filter((id) => !memberIds.has(id));
+    if (unknown.length > 0) return sendError(res, 422, 'Ada anggota yang bukan bagian tim ini');
+  }
   const project = await prisma.project.create({
     data: {
       teamId,
       name: body.name,
       description: body.description,
       avatarUrl: body.avatarUrl ?? undefined,
-      columns: {
-        create: [
-          { name: 'To Do', color: '#8A8F98', order: 0 },
-          { name: 'In Progress', color: '#0090FF', order: 1 },
-          { name: 'Done', color: '#46A758', order: 2 },
-        ],
-      },
+      ...(!source
+        ? {
+            columns: {
+              create: [
+                { name: 'To Do', color: '#8A8F98', order: 0 },
+                { name: 'In Progress', color: '#0090FF', order: 1 },
+                { name: 'Done', color: '#46A758', order: 2 },
+              ],
+            },
+          }
+        : {}),
     },
   });
+  if (!source) {
+    // Project baru: kolom + role bawaan + jabatan Member untuk anggota terpilih.
+    await createDefaultRoles(project.id);
+  } else {
+    // Duplikat: salin kolom dan role custom (tanpa task).
+    const [srcColumns, srcRoles] = await Promise.all([
+      prisma.boardColumn.findMany({ where: { projectId: source.id }, orderBy: { order: 'asc' } }),
+      prisma.projectRole.findMany({ where: { projectId: source.id } }),
+    ]);
+    await createDefaultRoles(project.id);
+    for (const c of srcColumns) {
+      await prisma.boardColumn.create({
+        data: { projectId: project.id, name: c.name, color: c.color, order: c.order },
+      });
+    }
+    for (const r of srcRoles.filter((x) => !x.system)) {
+      await prisma.projectRole.upsert({
+        where: { projectId_name: { projectId: project.id, name: r.name } },
+        update: { permissions: r.permissions },
+        create: { projectId: project.id, name: r.name, permissions: r.permissions },
+      });
+    }
+  }
+  const targetIds = body.memberUserIds ?? members.map((m) => m.userId);
+  const sourceMembers = source
+    ? await prisma.projectMember.findMany({
+        where: { projectId: source.id, userId: { in: targetIds } },
+        include: { role: { select: { name: true } } },
+      })
+    : [];
+  const sourceRoleByUser = new Map(sourceMembers.map((m) => [m.userId, m.role.name]));
+  for (const userId of targetIds) {
+    const wanted = sourceRoleByUser.get(userId) ?? 'Member';
+    let role = await prisma.projectRole.findUnique({
+      where: { projectId_name: { projectId: project.id, name: wanted } },
+    });
+    if (!role) {
+      role = await prisma.projectRole.findUnique({
+        where: { projectId_name: { projectId: project.id, name: 'Member' } },
+      });
+    }
+    if (role) {
+      try {
+        await prisma.projectMember.create({ data: { projectId: project.id, userId, roleId: role.id } });
+      } catch {
+        // abaikan duplikat balapan
+      }
+    }
+  }
   return res.status(201).json({ success: true, data: project });
 }

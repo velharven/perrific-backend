@@ -87,6 +87,7 @@ model User {
   teamMembers    TeamMember[]
   joinRequests   TeamJoinRequest[]
   decidedRequests TeamJoinRequest[] @relation("JoinRequestDecider")
+  projectMembers ProjectMember[]
   taskAssignees  TaskAssignee[]
   watchedTasks   TaskWatcher[]
   createdTasks   Task[]         @relation("TaskCreator")
@@ -165,6 +166,8 @@ model Project {
   team        Team          @relation(fields: [teamId], references: [id], onDelete: Cascade)
   tasks       Task[]
   columns     BoardColumn[]
+  roles       ProjectRole[]
+  members     ProjectMember[]
 
   @@map("projects")
 }
@@ -219,6 +222,40 @@ model BoardColumn {
 
   @@index([projectId, order])
   @@map("board_columns")
+}
+
+// Role custom per project: ADMIN/APPROVER/MEMBER bawaan + divisi
+// (Front/Back/Design) + buatan sendiri. permissions = daftar kunci izin.
+model ProjectRole {
+  id          String   @id @default(uuid())
+  projectId   String
+  name        String
+  system      String?  // ADMIN | APPROVER | MEMBER | null (null = custom/divisi)
+  permissions String[] @default([])
+  createdAt   DateTime @default(now())
+
+  project     Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  members     ProjectMember[]
+
+  @@unique([projectId, name])
+  @@map("project_roles")
+}
+
+// Jabatan user di satu project (satu user satu role per project).
+model ProjectMember {
+  id        String   @id @default(uuid())
+  projectId String
+  userId    String
+  roleId    String
+  createdAt DateTime @default(now())
+
+  project   Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role      ProjectRole @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  @@unique([projectId, userId])
+  @@index([projectId])
+  @@map("project_members")
 }
 
 // User yang mengerjakan sebuah task (bisa lebih dari satu).
