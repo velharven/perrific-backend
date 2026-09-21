@@ -1,0 +1,455 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ===== Enums =====
+// Role anggota dalam satu tim (F-02)
+enum TeamRole {
+  ADMIN
+  MEMBER
+}
+
+// Status permintaan bergabung ke tim (approve anggota baru oleh admin)
+enum JoinRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum ProjectStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+// Persetujuan task usulan anggota (anggota boleh membuat, admin menyetujui)
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+// Jenis aktivitas harian personal (F-05, F-09)
+enum ActivityType {
+  TASK      // hasil sinkronisasi task tim -> jadwal harian
+  BREAKDOWN // potongan kecil dari auto-breakdown task besar
+  CUSTOM    // aktivitas personal yang dibuat langsung
+}
+
+enum ActivityStatus {
+  PENDING
+  COMPLETED
+  SKIPPED
+}
+
+enum NotificationType {
+  TASK_ASSIGNED
+  TASK_UPDATED
+  DEADLINE_APPROACHING
+  TASK_OVERDUE
+  ACTIVITY_REMINDER
+  TEAM_INVITE
+  SYSTEM
+}
+
+// Jenis riwayat per task untuk tab Activities (F-12/F-13 ringan)
+enum TaskActivityKind {
+  MOVED     // card dipindah antar kolom kanban
+  ASSIGNED  // task diberi ke anggota
+  UNASSIGNED // anggota dihapus dari task
+  ATTACHMENT_ADDED // file/gambar diunggah ke task
+}
+
+// ===== Entities =====
+
+model User {
+  id             String   @id @default(uuid())
+  email          String   @unique
+  passwordHash   String?
+  googleId       String?  @unique
+  name           String
+  username       String?  @unique
+  avatarUrl      String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  teamMembers    TeamMember[]
+  joinRequests   TeamJoinRequest[]
+  decidedRequests TeamJoinRequest[] @relation("JoinRequestDecider")
+  taskAssignees  TaskAssignee[]
+  watchedTasks   TaskWatcher[]
+  createdTasks   Task[]         @relation("TaskCreator")
+  activityActions TaskActivity[] @relation("ActivityActor")
+  activityTargets TaskActivity[] @relation("ActivityTarget")
+  dailyActivities DailyActivity[]
+  notifications  Notification[]
+  comments       Comment[]
+  notes          Note[]
+
+  @@map("users")
+}
+
+model Team {
+  id          String        @id @default(uuid())
+  name        String
+  description String?
+  inviteCode  String?       @unique
+  inviteExpiresAt DateTime? // null = tanpa batas waktu
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  members     TeamMember[]
+  projects    Project[]
+  joinRequests TeamJoinRequest[]
+
+  @@map("teams")
+}
+
+// Junction table: relasi many-to-many User <-> Team + role (F-02)
+model TeamMember {
+  id        String   @id @default(uuid())
+  userId    String
+  teamId    String
+  role      TeamRole @default(MEMBER)
+  joinedAt  DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  team      Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, teamId])
+  @@map("team_members")
+}
+
+// Permintaan bergabung ke tim via kode/link invite.
+// Disetujui/ditolak admin; join langsung tanpa antre tidak lagi didukung.
+model TeamJoinRequest {
+  id          String            @id @default(uuid())
+  teamId      String
+  userId      String
+  status      JoinRequestStatus @default(PENDING)
+  createdAt   DateTime          @default(now())
+  decidedAt   DateTime?
+  decidedById String?
+
+  team      Team  @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user      User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  decidedBy User? @relation("JoinRequestDecider", fields: [decidedById], references: [id], onDelete: SetNull)
+
+  @@index([teamId, status])
+  @@map("team_join_requests")
+}
+
+model Project {
+  id          String        @id @default(uuid())
+  teamId      String
+  name        String
+  description String?
+  avatarUrl   String?
+  status      ProjectStatus @default(ACTIVE)
+  startDate   DateTime?
+  endDate     DateTime?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  team        Team          @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  tasks       Task[]
+  columns     BoardColumn[]
+
+  @@map("projects")
+}
+
+model Task {
+  id          String       @id @default(uuid())
+  projectId   String
+  columnId    String       // kolom kanban bebas per project (F-04 ala Taiga)
+  number      Int          // nomor urut per project ala Taiga (#1, #2, ...)
+  parentTaskId String?     // untuk auto-breakdown task besar (F-09)
+  title       String
+  description String?
+  priority    TaskPriority @default(MEDIUM)
+  approval    ApprovalStatus @default(APPROVED)
+  dueDate     DateTime?
+  order       Float        @default(0) // urutan drag-and-drop dalam kolom (F-04)
+  createdById String?      // pembuat task (untuk filter "dibuat oleh"; null = data lama)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  project       Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  column        BoardColumn     @relation(fields: [columnId], references: [id], onDelete: Restrict)
+  createdBy     User?           @relation("TaskCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  assignees     TaskAssignee[]
+  watchers      TaskWatcher[]
+  activities    TaskActivity[]
+  subtasks      Task[]          @relation("TaskSubtask")
+  parentTask    Task?           @relation("TaskSubtask", fields: [parentTaskId], references: [id], onDelete: SetNull)
+  dailyActivities DailyActivity[]
+  comments      Comment[]
+  attachments   Attachment[]
+
+  @@index([projectId])
+  @@index([columnId])
+  @@unique([projectId, number])
+  @@map("tasks")
+}
+
+// Kolom kanban bebas per project (F-04 ala Taiga): nama & urutan diatur
+// admin dari Settings project. Hapus kolom berisi task wajib memindahkan
+// isinya dulu (dipilih lewat popup di frontend).
+model BoardColumn {
+  id        String   @id @default(uuid())
+  projectId String
+  name      String
+  color     String   @default("#8A8F98") // swatch header kolom, bisa diubah admin
+  order     Float    @default(0)
+  createdAt DateTime @default(now())
+
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  tasks     Task[]
+
+  @@index([projectId, order])
+  @@map("board_columns")
+}
+
+// User yang mengerjakan sebuah task (bisa lebih dari satu).
+model TaskAssignee {
+  id        String   @id @default(uuid())
+  taskId    String
+  userId    String
+  createdAt DateTime @default(now())
+
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([taskId, userId])
+  @@index([taskId])
+  @@index([userId])
+  @@map("task_assignees")
+}
+
+// Pengamat task (watchers ala Taiga): anggota tim yang mengikuti update task
+// tanpa harus menjadi assignee.
+model TaskWatcher {
+  id        String   @id @default(uuid())
+  taskId    String
+  userId    String
+  createdAt DateTime @default(now())
+
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([taskId, userId])
+  @@index([taskId])
+  @@index([userId])
+  @@map("task_watchers")
+}
+
+// Aktivitas harian personal milik User (F-05, Notion-style), bisa terkait Task (F-08/F-09)
+model DailyActivity {
+  id         String         @id @default(uuid())
+  userId     String
+  taskId     String?        // FK hasil sinkronisasi/breakdown
+  title      String
+  description String?
+  date       DateTime
+  startTime  DateTime?
+  endTime    DateTime?
+  type       ActivityType   @default(CUSTOM)
+  status     ActivityStatus @default(PENDING)
+  icon       String?        // emoji Notion-style (mis. "📝", "🎯")
+  order      Float          @default(0)
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  task           Task?           @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  checklistItems ChecklistItem[]
+
+  @@index([userId])
+  @@index([date])
+  @@map("daily_activities")
+}
+
+model ChecklistItem {
+  id         String   @id @default(uuid())
+  activityId String
+  text       String
+  completed  Boolean  @default(false)
+  order      Float    @default(0)
+  createdAt  DateTime @default(now())
+
+  activity   DailyActivity @relation(fields: [activityId], references: [id], onDelete: Cascade)
+
+  @@index([activityId])
+  @@map("checklist_items")
+}
+
+model Notification {
+  id        String           @id @default(uuid())
+  userId    String
+  type      NotificationType
+  title     String
+  message   String?
+  read      Boolean          @default(false)
+  relatedTaskId String?
+  createdAt DateTime         @default(now())
+
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("notifications")
+}
+
+model Comment {
+  id        String   @id @default(uuid())
+  taskId    String
+  authorId  String
+  content   String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  author    User     @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
+  @@map("comments")
+}
+
+// Riwayat per task untuk tab Activities: siapa memindah card ke mana,
+// task diberi ke siapa / dihapus dari siapa.
+model TaskActivity {
+  id           String           @id @default(uuid())
+  taskId       String
+  actorId      String
+  kind         TaskActivityKind
+  fromColumn   String?
+  toColumn     String?
+  targetUserId String?
+  meta         Json?      // info tambahan mis. {filename, mimeType, size, attachmentId} untuk upload
+  createdAt    DateTime         @default(now())
+
+  task       Task  @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  actor      User  @relation("ActivityActor", fields: [actorId], references: [id], onDelete: Cascade)
+  targetUser User? @relation("ActivityTarget", fields: [targetUserId], references: [id], onDelete: SetNull)
+
+  @@index([taskId, createdAt])
+  @@map("task_activities")
+}
+
+// Lampiran file per task (disimpan dataURL; ponytail: pindah object storage bila menumpuk).
+model Attachment {
+  id        String   @id @default(uuid())
+  taskId    String
+  filename  String
+  mimeType  String
+  size      Int
+  dataUrl   String
+  description String? // caption pendek per file (diisi dari halaman detail task)
+  createdAt DateTime @default(now())
+
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
+  @@map("attachments")
+}
+
+// Jenis tab privat: NOTE = halaman kosong, DASHBOARD = isi /dashboard,
+// DAILY = isi /daily. Satu tabel agar URL /notes/:id, /dashboard/:id,
+// /daily/:id semua berkunci acak (uuid) seperti notes.
+enum NoteKind {
+  NOTE
+  DASHBOARD
+  DAILY
+  TABLE
+}
+
+enum TableColumnType {
+  TEXT
+  NUMBER
+  SELECT
+  DATE
+  CHECKBOX
+}
+
+// Halaman catatan kosong per akun (tab baru di sidebar PRIVAT, F-05 personal)
+model Note {
+  id        String   @id @default(uuid())
+  userId    String
+  kind      NoteKind @default(NOTE)
+  parentId  String?
+  title     String   @default("Tanpa judul")
+  content   String   @default("")
+  // Sampul halaman: CSS gradien preset atau JSON {src:dataURL,pos} upload.
+  // Null = tanpa sampul. TEXT karena dataURL gambar ratusan KB (ala avatar).
+  coverUrl  String?
+  order     Float    @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  parent    Note?    @relation("NoteChildren", fields: [parentId], references: [id], onDelete: Cascade)
+  children  Note[]   @relation("NoteChildren")
+  table     Table?
+  rowOf     TableRow? @relation("RowPage")
+
+  @@index([userId, parentId, order])
+  @@map("notes")
+}
+
+model Table {
+  id        String        @id @default(uuid())
+  noteId    String        @unique
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  note      Note          @relation(fields: [noteId], references: [id], onDelete: Cascade)
+  columns   TableColumn[]
+  rows      TableRow[]
+
+  @@map("tables")
+}
+
+model TableColumn {
+  id        String          @id @default(uuid())
+  tableId   String
+  name      String
+  type      TableColumnType @default(TEXT)
+  // Ikon bebas pilihan user (nama ikon set ActivityIcon). Null = ikuti ikon jenis.
+  icon      String?
+  options   Json            @default("[]")
+  order     Float           @default(0)
+
+  table     Table           @relation(fields: [tableId], references: [id], onDelete: Cascade)
+
+  @@index([tableId, order])
+  @@map("table_columns")
+}
+
+model TableRow {
+  id        String   @id @default(uuid())
+  tableId   String
+  // Halaman di balik baris (baris = halaman). SetNull agar baris selamat
+  // jadi data biasa bila halamannya dihapus; sebaliknya frontend yang
+  // menghapus note saat baris dihapus.
+  noteId    String?  @unique
+  values    Json     @default("{}")
+  order     Float    @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  table     Table    @relation(fields: [tableId], references: [id], onDelete: Cascade)
+  note      Note?    @relation("RowPage", fields: [noteId], references: [id], onDelete: SetNull)
+
+  @@index([tableId, order])
+  @@map("table_rows")
+}
