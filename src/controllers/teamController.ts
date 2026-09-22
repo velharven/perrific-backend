@@ -29,15 +29,19 @@ export async function listMyTeams(req: Request, res: Response) {
     where: { members: { some: { userId: req.userId } } },
     include: { members: { include: { user: { select: { id: true, name: true, avatarUrl: true } } } } },
   });
-  // Kode invite + kedaluwarsa hanya untuk admin tim masing-masing.
-  return res.json({
-    success: true,
-    data: teams.map((t) =>
-      t.members.some((m) => m.userId === req.userId && m.role === 'ADMIN')
-        ? t
-        : { ...t, inviteCode: null, inviteExpiresAt: null },
-    ),
-  });
+  // Kode invite + kedaluwarsa hanya untuk admin tim atau role kelola invite.
+  const data = await Promise.all(
+    teams.map(async (t) => {
+      if (t.members.some((m) => m.userId === req.userId && m.role === 'ADMIN')) {
+        return { ...t, canManageInvite: true };
+      }
+      if (await canAny(req.userId, t.id, 'invite.manage')) {
+        return { ...t, canManageInvite: true };
+      }
+      return { ...t, inviteCode: null, inviteExpiresAt: null, canManageInvite: false };
+    }),
+  );
+  return res.json({ success: true, data });
 }
 
 export async function createTeam(req: Request, res: Response) {
@@ -64,14 +68,19 @@ export async function getTeam(req: Request, res: Response) {
     include: { members: { include: { user: { select: { id: true, name: true, email: true, avatarUrl: true } } } } },
   });
   if (!team) return sendError(res, 404, 'Tim tidak ditemukan');
-  // Kode invite hanya untuk admin tim ini (anggota biasa tak perlu tahu).
+  // Kode invite hanya untuk admin tim atau role kelola invite.
   if (req.userId) {
     const membership = await prisma.teamMember.findUnique({
       where: { userId_teamId: { userId: req.userId, teamId: team.id } },
     });
-    if (membership?.role === 'ADMIN') return res.json({ success: true, data: team });
+    const canInvite =
+      membership?.role === 'ADMIN' || (await canAny(req.userId, team.id, 'invite.manage'));
+    if (canInvite) return res.json({ success: true, data: { ...team, canManageInvite: true } });
   }
-  return res.json({ success: true, data: { ...team, inviteCode: null, inviteExpiresAt: null } });
+  return res.json({
+    success: true,
+    data: { ...team, inviteCode: null, inviteExpiresAt: null, canManageInvite: false },
+  });
 }
 
 const updateTeamSchema = z.object({
@@ -164,7 +173,7 @@ const updateInviteSchema = z.object({
   regenerate: z.boolean().optional(),
 });
 
-// Atur kedaluwarsa invite + putar kode baru (ADMIN saja).
+// Atur kedaluwarsa invite + putar kode baru (ADMIN atau role kelola invite).
 export async function updateInvite(req: Request, res: Response) {
   const body = updateInviteSchema.parse(req.body);
   if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
@@ -173,7 +182,9 @@ export async function updateInvite(req: Request, res: Response) {
     where: { teamId, userId: req.userId },
   });
   if (!membership) return sendError(res, 403, 'Bukan anggota tim ini');
-  if (membership.role !== 'ADMIN') return sendError(res, 403, 'Hanya admin tim yang bisa mengatur invite');
+  if (membership.role !== 'ADMIN' && !(await canAny(req.userId, teamId, 'invite.manage'))) {
+    return sendError(res, 403, 'Hanya admin tim atau role kelola invite yang bisa mengatur invite');
+  }
   const team = await prisma.team.update({
     where: { id: teamId },
     data: {
