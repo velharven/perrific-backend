@@ -1,5 +1,6 @@
 import type { Request, Response } from 'express';
 import { z } from 'zod';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { sendError } from '../lib/errors';
 
@@ -115,6 +116,7 @@ const createActivitySchema = z.object({
   taskId: z.string().optional(),
   icon: z.string().max(8).optional(),
   order: z.number().optional(),
+  customValues: z.record(z.union([z.string(), z.number(), z.boolean()])).nullable().optional(),
   checklist: z
     .array(z.object({ text: z.string().min(1) }))
     .optional(),
@@ -148,6 +150,7 @@ export async function createActivity(req: Request, res: Response) {
       taskId: body.taskId,
       icon: body.icon,
       order: body.order ?? 0,
+      customValues: (body.customValues ?? undefined) as unknown as Prisma.InputJsonValue | undefined,
       checklistItems: body.checklist
         ? {
             create: body.checklist.map((c, idx) => ({
@@ -352,6 +355,7 @@ export async function duplicateActivity(req: Request, res: Response) {
       icon: source.icon,
       order: source.order + 0.5,
       taskId: source.taskId,
+      customValues: source.customValues ?? undefined,
       checklistItems: {
         create: source.checklistItems.map((c) => ({
           text: c.text,
@@ -367,4 +371,195 @@ export async function duplicateActivity(req: Request, res: Response) {
   });
 
   return res.status(201).json({ success: true, data: copy });
+}
+
+// ============ Daily custom columns (properti ala Notion, user-scoped) ============
+const createColumnSchema = z.object({
+  name: z.string().trim().min(1).max(60),
+  type: z.enum(['TEXT', 'NUMBER', 'DATE', 'SELECT', 'CHECKBOX']).default('TEXT'),
+  icon: z.string().max(8).optional(),
+  options: z.array(z.string().trim().min(1).max(60)).max(50).optional(),
+});
+
+export async function listMyColumns(req: Request, res: Response) {
+  if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
+  const columns = await prisma.dailyColumn.findMany({
+    where: { userId: req.userId },
+    orderBy: [{ order: 'asc' }, { createdAt: 'asc' }],
+  });
+  return res.json({ success: true, data: columns });
+}
+
+export async function createColumn(req: Request, res: Response) {
+  if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
+  const body = createColumnSchema.parse(req.body);
+  const maxOrder = await prisma.dailyColumn.aggregate({
+    where: { userId: req.userId },
+    _max: { order: true },
+  });
+  const column = await prisma.dailyColumn.create({
+    data: {
+      userId: req.userId,
+      name: body.name,
+      type: body.type,
+      icon: body.icon,
+      ...(body.type === 'SELECT' ? { options: body.options ?? [] } : { options: Prisma.DbNull }),
+      order: (maxOrder._max.order ?? -1) + 1,
+    },
+  });
+  return res.status(201).json({ success: true, data: column });
+}
+
+const updateColumnSchema = z.object({
+  name: z.string().trim().min(1).max(60).optional(),
+  type: z.enum(['TEXT', 'NUMBER', 'DATE', 'SELECT', 'CHECKBOX']).optional(),
+  icon: z.string().max(8).nullable().optional(),
+  options: z.array(z.string().trim().min(1).max(60)).max(50).optional(),
+});
+
+export async function updateColumn(req: Request, res: Response) {
+  if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
+  const body = updateColumnSchema.parse(req.body);
+  const existing = await prisma.dailyColumn.findFirst({
+    where: { id: req.params.columnId, userId: req.userId },
+  });
+  if (!existing) return sendError(res, 404, 'Properti tidak ditemukan');
+
+  const nextType = body.type ?? existing.type;
+  const column = await prisma.dailyColumn.update({
+    where: { id: existing.id },
+    data: {
+      ...(body.name !== undefined ? { name: body.name } : {}),
+      ...(body.type !== undefined ? { type: body.type } : {}),
+      ...(body.icon !== undefined ? { icon: body.icon } : {}),
+      // options hanya bermakna untuk SELECT; ganti tipe lain -> null
+      ...(body.options !== undefined || body.type !== undefined
+        ? nextType === 'SELECT'
+          ? { options: body.options ?? [] }
+          : { options: Prisma.DbNull }
+        : {}),
+    },
+  });
+  return res.json({ success: true, data: column });
+}
+
+export async function deleteColumn(req: Request, res: Response) {
+  if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
+  const existing = await prisma.dailyColumn.findFirst({
+    where: { id: req.params.columnId, userId: req.userId },
+  });
+  if (!existing) return sendError(res, 404, 'Properti tidak ditemukan');
+
+  await prisma.dailyColumn.delete({ where: { id: existing.id } });
+
+  // Bersihkan nilai properti dari semua aktivitas user (background-safe, skala personal)
+  const acts = await prisma.dailyActivity.findMany({
+    where: { userId: req.userId },
+    select: { id: true, customValues: true },
+  });
+  const dirty = acts.filter((a) => {
+    const v = (a.customValues ?? {}) as Record<string, unknown>;
+    return v !== null && typeof v === 'object' && existing.id in v;
+  });
+  if (dirty.length > 0) {
+    await prisma.$transaction(
+      dirty.map((a) => {
+        const v = { ...((a.customValues ?? {}) as Record<string, unknown>) };
+        delete v[existing.id];
+        return prisma.dailyActivity.update({
+          where: { id: a.id },
+          data: { customValues: v as unknown as Prisma.InputJsonValue },
+        });
+      }),
+    );
+  }
+
+  return res.json({ success: true, data: { id: existing.id } });
+}
+
+const reorderColumnsSchema = z.object({
+  orderedIds: z.array(z.string()).min(1),
+});
+
+export async function reorderColumns(req: Request, res: Response) {
+  if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
+  const body = reorderColumnsSchema.parse(req.body);
+  const count = await prisma.dailyColumn.count({
+    where: { id: { in: body.orderedIds }, userId: req.userId },
+  });
+  if (count !== body.orderedIds.length) return sendError(res, 403, 'Beberapa properti tidak valid');
+  await prisma.$transaction(
+    body.orderedIds.map((id, idx) => prisma.dailyColumn.update({ where: { id }, data: { order: idx } })),
+  );
+  return res.json({ success: true, data: { orderedIds: body.orderedIds } });
+}
+
+// ============ Cell value (nilai properti per aktivitas) ============
+const setCellValueSchema = z.object({
+  columnId: z.string().min(1),
+  value: z.unknown(),
+});
+
+function normalizeCellValue(
+  type: string,
+  options: unknown,
+  value: unknown,
+): { ok: boolean; normalized?: string | number | boolean | null; message?: string } {
+  if (value === null || value === undefined || value === '') return { ok: true, normalized: null };
+  switch (type) {
+    case 'TEXT':
+      return typeof value === 'string' ? { ok: true, normalized: value } : { ok: false, message: 'Nilai teks tidak valid' };
+    case 'NUMBER':
+      return typeof value === 'number' && Number.isFinite(value)
+        ? { ok: true, normalized: value }
+        : { ok: false, message: 'Nilai angka tidak valid' };
+    case 'DATE': {
+      if (typeof value !== 'string') return { ok: false, message: 'Nilai tanggal tidak valid' };
+      const d = new Date(value);
+      return isNaN(d.getTime()) ? { ok: false, message: 'Nilai tanggal tidak valid' } : { ok: true, normalized: value };
+    }
+    case 'SELECT': {
+      const opts = Array.isArray(options) ? options.filter((o) => typeof o === 'string') : [];
+      return typeof value === 'string' && opts.includes(value)
+        ? { ok: true, normalized: value }
+        : { ok: false, message: 'Pilihan tidak valid' };
+    }
+    case 'CHECKBOX':
+      return typeof value === 'boolean' ? { ok: true, normalized: value } : { ok: false, message: 'Nilai centang tidak valid' };
+    default:
+      return { ok: false, message: 'Tipe properti tidak dikenal' };
+  }
+}
+
+export async function setCellValue(req: Request, res: Response) {
+  if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
+  const body = setCellValueSchema.parse(req.body);
+
+  const activity = await prisma.dailyActivity.findFirst({
+    where: { id: req.params.activityId, userId: req.userId },
+  });
+  if (!activity) return sendError(res, 404, 'Aktivitas tidak ditemukan');
+
+  const column = await prisma.dailyColumn.findFirst({
+    where: { id: body.columnId, userId: req.userId },
+  });
+  if (!column) return sendError(res, 404, 'Properti tidak ditemukan');
+
+  const checked = normalizeCellValue(column.type, column.options, body.value);
+  if (!checked.ok) return sendError(res, 422, checked.message ?? 'Nilai tidak valid');
+
+  const current = ((activity.customValues ?? {}) as Record<string, unknown>) ?? {};
+  const next = { ...current };
+  if (checked.normalized === null || checked.normalized === undefined) delete next[column.id];
+  else next[column.id] = checked.normalized;
+
+  const updated = await prisma.dailyActivity.update({
+    where: { id: activity.id },
+    data: { customValues: next as unknown as Prisma.InputJsonValue },
+    include: {
+      checklistItems: { orderBy: { order: 'asc' } },
+      task: { select: { id: true, title: true } },
+    },
+  });
+  return res.json({ success: true, data: updated });
 }

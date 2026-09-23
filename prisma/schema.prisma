@@ -94,6 +94,7 @@ model User {
   activityActions TaskActivity[] @relation("ActivityActor")
   activityTargets TaskActivity[] @relation("ActivityTarget")
   dailyActivities DailyActivity[]
+  dailyColumns DailyColumn[]
   notifications  Notification[]
   comments       Comment[]
   notes          Note[]
@@ -305,6 +306,7 @@ model DailyActivity {
   status     ActivityStatus @default(PENDING)
   icon       String?        // emoji Notion-style (mis. "📝", "🎯")
   order      Float          @default(0)
+  customValues Json?        // peta columnId -> nilai properti kustom (DailyColumn)
   createdAt  DateTime       @default(now())
   updatedAt  DateTime       @updatedAt
 
@@ -329,6 +331,33 @@ model ChecklistItem {
 
   @@index([activityId])
   @@map("checklist_items")
+}
+
+// Properti kustom database harian personal (ala kolom Notion).
+// Definisi milik user (lintas tanggal); nilainya di DailyActivity.customValues.
+enum DailyColumnType {
+  TEXT
+  NUMBER
+  DATE
+  SELECT
+  CHECKBOX
+}
+
+model DailyColumn {
+  id        String          @id @default(uuid())
+  userId    String
+  name      String
+  type      DailyColumnType @default(TEXT)
+  icon      String?
+  options   Json?           // string[] pilihan untuk SELECT
+  order     Float           @default(0)
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("daily_columns")
 }
 
 model Notification {
