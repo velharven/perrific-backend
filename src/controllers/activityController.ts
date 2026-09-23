@@ -3,6 +3,11 @@ import { z } from 'zod';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { sendError } from '../lib/errors';
+import {
+  pushActivityToGoogleCalendar,
+  deleteEventFromGoogleCalendar,
+} from './googleCalendarController';
+import { emitToUser } from '../lib/socket';
 
 // ============ Helpers ============
 function parseLocalDate(s: string): Date | null {
@@ -28,8 +33,11 @@ function parseDateRange(query: Record<string, unknown>) {
     if (d) {
       gte = new Date(d);
       gte.setHours(0, 0, 0, 0);
-      lt = new Date(gte);
+      gte = new Date(gte.getTime() - 14 * 60 * 60 * 1000);
+      lt = new Date(d);
+      lt.setHours(0, 0, 0, 0);
       lt.setDate(lt.getDate() + 1);
+      lt = new Date(lt.getTime() + 14 * 60 * 60 * 1000);
     }
   } else if (from || to) {
     if (from) {
@@ -37,6 +45,7 @@ function parseDateRange(query: Record<string, unknown>) {
       if (f) {
         gte = new Date(f);
         gte.setHours(0, 0, 0, 0);
+        gte = new Date(gte.getTime() - 14 * 60 * 60 * 1000);
       }
     }
     if (to) {
@@ -45,6 +54,7 @@ function parseDateRange(query: Record<string, unknown>) {
         lt = new Date(t);
         lt.setHours(0, 0, 0, 0);
         lt.setDate(lt.getDate() + 1);
+        lt = new Date(lt.getTime() + 14 * 60 * 60 * 1000);
       }
     }
   }
@@ -166,6 +176,13 @@ export async function createActivity(req: Request, res: Response) {
     },
   });
 
+  // Otomatis sinkronkan ke Google Calendar jika akun terhubung
+  void pushActivityToGoogleCalendar(req.userId, activity.id).catch((err) => {
+    console.error('[activityController] Gagal auto-push ke Google Calendar:', err);
+  });
+
+  emitToUser(req.userId, 'calendar:synced', { action: 'create', activityId: activity.id });
+
   return res.status(201).json({ success: true, data: activity });
 }
 
@@ -220,6 +237,13 @@ export async function updateActivity(req: Request, res: Response) {
     },
   });
 
+  // Otomatis sinkronkan pembaruan ke Google Calendar jika terhubung
+  void pushActivityToGoogleCalendar(req.userId, activity.id).catch((err) => {
+    console.error('[activityController] Gagal auto-update ke Google Calendar:', err);
+  });
+
+  emitToUser(req.userId, 'calendar:synced', { action: 'update', activityId: activity.id });
+
   return res.json({ success: true, data: activity });
 }
 
@@ -232,7 +256,16 @@ export async function deleteActivity(req: Request, res: Response) {
     where: { id: req.params.activityId, userId: req.userId },
   });
   if (!existing) return sendError(res, 404, 'Aktivitas tidak ditemukan');
+
+  // Bersihkan event Google Calendar di latar belakang jika tertaut
+  if (existing.googleEventId) {
+    void deleteEventFromGoogleCalendar(req.userId, existing.googleEventId).catch((err) => {
+      console.error('[activityController] Gagal auto-delete dari Google Calendar:', err);
+    });
+  }
+
   await prisma.dailyActivity.delete({ where: { id: req.params.activityId } });
+  emitToUser(req.userId, 'calendar:synced', { action: 'delete', activityId: req.params.activityId });
   return res.json({ success: true, data: { id: req.params.activityId } });
 }
 

@@ -6,6 +6,7 @@ const router = Router();
 
 router.use(authRequired);
 
+router.get('/assigned/me', taskController.listMyAssignedTasks);
 router.get('/:taskId', taskController.getTask);
 router.patch('/:taskId', taskController.updateTask);
 router.post('/:taskId/comments', taskController.addComment);

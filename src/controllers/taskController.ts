@@ -21,6 +21,40 @@ export async function getTask(req: Request, res: Response) {
   return res.json({ success: true, data: withWatchers(withAssignees(task)) });
 }
 
+export async function listMyAssignedTasks(req: Request, res: Response) {
+  if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
+
+  const tasks = await prisma.task.findMany({
+    where: {
+      assignees: { some: { userId: req.userId } },
+      approval: 'APPROVED',
+    },
+    include: {
+      ...assigneesInclude,
+      ...watchersInclude,
+      ...createdBySelect,
+      ...columnSelect,
+      project: {
+        select: {
+          id: true,
+          name: true,
+          team: { select: { id: true, name: true } },
+        },
+      },
+      dailyActivities: {
+        where: { userId: req.userId },
+        select: { id: true, date: true, startTime: true, endTime: true },
+      },
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+
+  return res.json({
+    success: true,
+    data: tasks.map((t) => withWatchers(withAssignees(t))),
+  });
+}
+
 const updateTaskSchema = z.object({
   title: z.string().min(1).optional(),
   description: z.string().optional(),

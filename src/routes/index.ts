@@ -8,6 +8,7 @@ import notificationRoutes from './notification.routes';
 import dashboardRoutes from './dashboard.routes';
 import noteRoutes from './note.routes';
 import tableRoutes from './table.routes';
+import calendarRoutes from './calendar.routes';
 import { health } from '../controllers';
 
 const router = Router();
@@ -22,5 +23,6 @@ router.use('/notifications', notificationRoutes);
 router.use('/dashboard', dashboardRoutes);
 router.use('/notes', noteRoutes);
 router.use('/tables', tableRoutes);
+router.use('/calendar', calendarRoutes);
 
 export default router;

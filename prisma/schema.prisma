@@ -81,6 +81,12 @@ model User {
   name           String
   username       String?  @unique
   avatarUrl      String?
+  googleCalendarConnected   Boolean   @default(false)
+  googleCalendarEmail       String?
+  googleCalendarName        String?
+  googleCalendarAvatarUrl   String?
+  googleCalendarAccessToken String?
+  googleCalendarSyncedAt    DateTime?
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
@@ -307,6 +313,7 @@ model DailyActivity {
   icon       String?        // emoji Notion-style (mis. "📝", "🎯")
   order      Float          @default(0)
   customValues Json?        // peta columnId -> nilai properti kustom (DailyColumn)
+  googleEventId String?     // ID event pada Google Calendar
   createdAt  DateTime       @default(now())
   updatedAt  DateTime       @updatedAt
 
