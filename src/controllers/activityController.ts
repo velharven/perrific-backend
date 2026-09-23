@@ -373,10 +373,28 @@ export async function duplicateActivity(req: Request, res: Response) {
   return res.status(201).json({ success: true, data: copy });
 }
 
+const dailyColumnTypes = [
+  'TEXT',
+  'NUMBER',
+  'DATE',
+  'SELECT',
+  'CHECKBOX',
+  'STATUS',
+  'PERSON',
+  'FILES',
+  'URL',
+  'PHONE',
+  'EMAIL',
+  'CATEGORY',
+  'START_TIME',
+  'END_TIME',
+] as const;
+
 // ============ Daily custom columns (properti ala Notion, user-scoped) ============
 const createColumnSchema = z.object({
+  id: z.string().uuid().optional(),
   name: z.string().trim().min(1).max(60),
-  type: z.enum(['TEXT', 'NUMBER', 'DATE', 'SELECT', 'CHECKBOX']).default('TEXT'),
+  type: z.enum(dailyColumnTypes).default('TEXT'),
   icon: z.string().max(8).optional(),
   options: z.array(z.string().trim().min(1).max(60)).max(50).optional(),
 });
@@ -399,9 +417,10 @@ export async function createColumn(req: Request, res: Response) {
   });
   const column = await prisma.dailyColumn.create({
     data: {
+      ...(body.id ? { id: body.id } : {}),
       userId: req.userId,
       name: body.name,
-      type: body.type,
+      type: body.type as any,
       icon: body.icon,
       ...(body.type === 'SELECT' ? { options: body.options ?? [] } : { options: Prisma.DbNull }),
       order: (maxOrder._max.order ?? -1) + 1,
@@ -412,7 +431,7 @@ export async function createColumn(req: Request, res: Response) {
 
 const updateColumnSchema = z.object({
   name: z.string().trim().min(1).max(60).optional(),
-  type: z.enum(['TEXT', 'NUMBER', 'DATE', 'SELECT', 'CHECKBOX']).optional(),
+  type: z.enum(dailyColumnTypes).optional(),
   icon: z.string().max(8).nullable().optional(),
   options: z.array(z.string().trim().min(1).max(60)).max(50).optional(),
 });
@@ -430,7 +449,7 @@ export async function updateColumn(req: Request, res: Response) {
     where: { id: existing.id },
     data: {
       ...(body.name !== undefined ? { name: body.name } : {}),
-      ...(body.type !== undefined ? { type: body.type } : {}),
+      ...(body.type !== undefined ? { type: body.type as any } : {}),
       ...(body.icon !== undefined ? { icon: body.icon } : {}),
       // options hanya bermakna untuk SELECT; ganti tipe lain -> null
       ...(body.options !== undefined || body.type !== undefined
@@ -505,14 +524,26 @@ function normalizeCellValue(
   options: unknown,
   value: unknown,
 ): { ok: boolean; normalized?: string | number | boolean | null; message?: string } {
-  if (value === null || value === undefined || value === '') return { ok: true, normalized: null };
+  if (value === null || value === undefined || (typeof value === 'string' && value.trim() === '')) {
+    return { ok: true, normalized: null };
+  }
   switch (type) {
+    case 'PHONE':
+      // Kolom telepon bisa menyimpan format apapun: teks huruf, angka acak, simbol, spasi, dsb.
+      if (typeof value === 'string') return { ok: true, normalized: value };
+      if (typeof value === 'number' || typeof value === 'boolean') return { ok: true, normalized: String(value) };
+      return { ok: false, message: 'Nilai telepon tidak valid' };
     case 'TEXT':
-      return typeof value === 'string' ? { ok: true, normalized: value } : { ok: false, message: 'Nilai teks tidak valid' };
+      if (typeof value === 'string') return { ok: true, normalized: value };
+      if (typeof value === 'number' || typeof value === 'boolean') return { ok: true, normalized: String(value) };
+      return { ok: false, message: 'Nilai teks tidak valid' };
     case 'NUMBER':
-      return typeof value === 'number' && Number.isFinite(value)
-        ? { ok: true, normalized: value }
-        : { ok: false, message: 'Nilai angka tidak valid' };
+      if (typeof value === 'number' && Number.isFinite(value)) return { ok: true, normalized: value };
+      if (typeof value === 'string' && value.trim() !== '') {
+        const num = Number(value);
+        if (Number.isFinite(num)) return { ok: true, normalized: num };
+      }
+      return { ok: false, message: 'Nilai angka tidak valid' };
     case 'DATE': {
       if (typeof value !== 'string') return { ok: false, message: 'Nilai tanggal tidak valid' };
       const d = new Date(value);
@@ -523,6 +554,40 @@ function normalizeCellValue(
       return typeof value === 'string' && opts.includes(value)
         ? { ok: true, normalized: value }
         : { ok: false, message: 'Pilihan tidak valid' };
+    }
+    case 'STATUS': {
+      return typeof value === 'string'
+        ? { ok: true, normalized: value }
+        : { ok: false, message: 'Nilai status tidak valid' };
+    }
+    case 'PERSON': {
+      if (typeof value === 'string') return { ok: true, normalized: value };
+      if (typeof value === 'number') return { ok: true, normalized: String(value) };
+      return { ok: false, message: 'Nilai orang tidak valid' };
+    }
+    case 'FILES': {
+      if (typeof value === 'string') return { ok: true, normalized: value };
+      return { ok: false, message: 'Nilai file tidak valid' };
+    }
+    case 'URL': {
+      if (typeof value === 'string') return { ok: true, normalized: value };
+      return { ok: false, message: 'Nilai URL tidak valid' };
+    }
+    case 'EMAIL': {
+      if (typeof value === 'string') return { ok: true, normalized: value };
+      return { ok: false, message: 'Nilai email tidak valid' };
+    }
+    case 'CATEGORY': {
+      return typeof value === 'string'
+        ? { ok: true, normalized: value }
+        : { ok: false, message: 'Nilai kategori tidak valid' };
+    }
+    case 'START_TIME':
+    case 'END_TIME': {
+      if (typeof value === 'string') {
+        return { ok: true, normalized: value };
+      }
+      return { ok: false, message: 'Nilai waktu tidak valid' };
     }
     case 'CHECKBOX':
       return typeof value === 'boolean' ? { ok: true, normalized: value } : { ok: false, message: 'Nilai centang tidak valid' };

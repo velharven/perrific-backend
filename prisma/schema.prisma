@@ -341,6 +341,15 @@ enum DailyColumnType {
   DATE
   SELECT
   CHECKBOX
+  STATUS
+  PERSON
+  FILES
+  URL
+  PHONE
+  EMAIL
+  CATEGORY
+  START_TIME
+  END_TIME
 }
 
 model DailyColumn {

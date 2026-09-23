@@ -1,0 +1,10 @@
+-- AlterEnum
+ALTER TYPE "DailyColumnType" ADD VALUE 'STATUS';
+ALTER TYPE "DailyColumnType" ADD VALUE 'PERSON';
+ALTER TYPE "DailyColumnType" ADD VALUE 'FILES';
+ALTER TYPE "DailyColumnType" ADD VALUE 'URL';
+ALTER TYPE "DailyColumnType" ADD VALUE 'PHONE';
+ALTER TYPE "DailyColumnType" ADD VALUE 'EMAIL';
+ALTER TYPE "DailyColumnType" ADD VALUE 'CATEGORY';
+ALTER TYPE "DailyColumnType" ADD VALUE 'START_TIME';
+ALTER TYPE "DailyColumnType" ADD VALUE 'END_TIME';
