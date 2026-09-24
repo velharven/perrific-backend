@@ -74,11 +74,6 @@ export async function googleLogin(req: Request, res: Response) {
 
   const byGoogleId = await prisma.user.findUnique({ where: { googleId: profile.googleId } });
   if (byGoogleId) {
-    // Sync avatar dari Google jika berubah / sebelumnya kosong.
-    // Ini yang menyebabkan "di laptop lain muncul, di laptop ini tidak":
-    // user lama bisa punya avatarUrl null dan tidak pernah ter-update.
-    // Google picture (lh3.googleusercontent.com) juga butuh refresh berkala.
-    // Jangan timpa foto custom (data:image/...) yang di-upload user di /settings.
     const current = byGoogleId.avatarUrl;
     const isCustomDataUrl = current?.startsWith('data:image/');
     const shouldSyncAvatar =

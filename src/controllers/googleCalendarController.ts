@@ -23,6 +23,7 @@ interface GoogleCalendarEventItem {
   description?: string;
   location?: string;
   htmlLink?: string;
+  status?: string;
   start?: { dateTime?: string; date?: string };
   end?: { dateTime?: string; date?: string };
 }
@@ -209,16 +210,18 @@ export async function listEvents(req: Request, res: Response) {
   const gData = (await gRes.json()) as { items?: GoogleCalendarEventItem[] };
   const items = gData.items ?? [];
 
-  const formatted = items.map((item) => ({
-    id: item.id,
-    title: item.summary || '(Tanpa judul)',
-    description: item.description || null,
-    location: item.location || null,
-    htmlLink: item.htmlLink || null,
-    start: item.start?.dateTime || item.start?.date,
-    end: item.end?.dateTime || item.end?.date,
-    allDay: !item.start?.dateTime,
-  }));
+  const formatted = items
+    .filter((item) => item.status !== 'cancelled' && Boolean(item.start?.dateTime || item.start?.date))
+    .map((item) => ({
+      id: item.id,
+      title: item.summary || '(Tanpa judul)',
+      description: item.description || null,
+      location: item.location || null,
+      htmlLink: item.htmlLink || null,
+      start: item.start?.dateTime || item.start?.date,
+      end: item.end?.dateTime || item.end?.date,
+      allDay: !item.start?.dateTime,
+    }));
 
   return res.json({ success: true, data: formatted });
 }
@@ -237,34 +240,39 @@ export async function pushActivityToGoogleCalendar(userId: string, activityId: s
   const hasValidStartTime = activity.startTime && !isNaN(activity.startTime.getTime());
   const hasValidEndTime = activity.endTime && !isNaN(activity.endTime.getTime());
 
-  let startPayload: { dateTime?: string; date?: string };
-  let endPayload: { dateTime?: string; date?: string };
+  let startIso: string | undefined;
+  let endIso: string | undefined;
+  let startStr: string | undefined;
+  let endStr: string | undefined;
+
+  let startPayload: { dateTime?: string | null; date?: string | null };
+  let endPayload: { dateTime?: string | null; date?: string | null };
 
   if (hasValidStartTime) {
-    const startIso = activity.startTime!.toISOString();
-    let endIso: string;
+    startIso = activity.startTime!.toISOString();
     if (hasValidEndTime && activity.endTime!.getTime() > activity.startTime!.getTime()) {
       endIso = activity.endTime!.toISOString();
     } else {
       endIso = new Date(activity.startTime!.getTime() + 3600_000).toISOString();
     }
-    startPayload = { dateTime: startIso };
-    endPayload = { dateTime: endIso };
+    // Set date: null agar PATCH Google API menghapus properti format all-day sebelumnya
+    startPayload = { dateTime: startIso, date: null };
+    endPayload = { dateTime: endIso, date: null };
   } else {
     // Untuk event sepanjang hari (all-day), Google Calendar API mewajibkan:
     // 1. Format tanggal YYYY-MM-DD
     // 2. end.date bersifat EKSKLUSIF (harus minimal 1 hari setelah start.date).
-    // Jika start.date sama dengan end.date, Google akan menolak dengan error 400 "Invalid start time."
     const startDate = new Date(activity.date);
     const baseDate = isNaN(startDate.getTime()) ? new Date() : startDate;
-    const startStr = baseDate.toISOString().split('T')[0];
+    startStr = baseDate.toISOString().split('T')[0];
 
     const nextDate = new Date(baseDate);
     nextDate.setUTCDate(nextDate.getUTCDate() + 1);
-    const endStr = nextDate.toISOString().split('T')[0];
+    endStr = nextDate.toISOString().split('T')[0];
 
-    startPayload = { date: startStr };
-    endPayload = { date: endStr };
+    // Set dateTime: null agar PATCH Google API menghapus properti jam sebelumnya
+    startPayload = { date: startStr, dateTime: null };
+    endPayload = { date: endStr, dateTime: null };
   }
 
   let description = activity.description || '';
@@ -276,8 +284,19 @@ export async function pushActivityToGoogleCalendar(userId: string, activityId: s
   const eventPayload = {
     summary: activity.title,
     description: description.trim() || undefined,
+    status: 'confirmed',
     start: startPayload,
     end: endPayload,
+  };
+
+  const cleanStartPayload = hasValidStartTime ? { dateTime: startIso } : { date: startStr };
+  const cleanEndPayload = hasValidStartTime ? { dateTime: endIso } : { date: endStr };
+  const postPayload = {
+    summary: activity.title,
+    description: description.trim() || undefined,
+    status: 'confirmed',
+    start: cleanStartPayload,
+    end: cleanEndPayload,
   };
 
   const isUpdate = Boolean(activity.googleEventId);
@@ -297,15 +316,15 @@ export async function pushActivityToGoogleCalendar(userId: string, activityId: s
         },
       );
 
-      // Jika event di Google Calendar sudah tidak ada (404), buat ulang via POST
-      if (gRes.status === 404) {
+      // Jika event di Google Calendar sudah tidak ada (404/410) atau konflik format all-day vs timed (400), buat ulang via POST
+      if (gRes.status === 404 || gRes.status === 410 || gRes.status === 400) {
         gRes = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
           method: 'POST',
           headers: {
             Authorization: `Bearer ${tokenResult.accessToken}`,
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify(eventPayload),
+          body: JSON.stringify(postPayload),
         });
       }
     } else {
@@ -315,7 +334,7 @@ export async function pushActivityToGoogleCalendar(userId: string, activityId: s
           Authorization: `Bearer ${tokenResult.accessToken}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(eventPayload),
+        body: JSON.stringify(postPayload),
       });
     }
 
@@ -325,7 +344,25 @@ export async function pushActivityToGoogleCalendar(userId: string, activityId: s
       return null;
     }
 
-    const createdEvent = (await gRes.json()) as { id: string };
+    const createdEvent = (await gRes.json()) as { id: string; status?: string };
+
+    // Jika event yang di-patch ternyata masih berstatus cancelled di Google Calendar, buat event baru via POST
+    if (createdEvent.status === 'cancelled') {
+      const fallbackRes = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${tokenResult.accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(postPayload),
+      });
+
+      if (fallbackRes.ok) {
+        const fallbackData = (await fallbackRes.json()) as { id: string; status?: string };
+        createdEvent.id = fallbackData.id;
+        createdEvent.status = fallbackData.status || 'confirmed';
+      }
+    }
 
     if (createdEvent.id && createdEvent.id !== activity.googleEventId) {
       await prisma.dailyActivity.update({
@@ -337,6 +374,12 @@ export async function pushActivityToGoogleCalendar(userId: string, activityId: s
     await prisma.user.update({
       where: { id: userId },
       data: { googleCalendarSyncedAt: new Date() },
+    });
+
+    emitToUser(userId, 'calendar:synced', {
+      action: isUpdate ? 'update' : 'create',
+      activityId: activity.id,
+      googleEventId: createdEvent.id || activity.googleEventId,
     });
 
     return createdEvent.id || activity.googleEventId || null;
@@ -429,7 +472,17 @@ export async function autoSyncTwoWay(
       const items = gData.items ?? [];
 
       for (const item of items) {
-        if (!item.id || !item.start) continue;
+        if (!item.id) continue;
+
+        if (item.status === 'cancelled') {
+          // Jika event berstatus cancelled di Google, dan masih ada di DailyActivity lokal, bersihkan juga di lokal
+          await prisma.dailyActivity.deleteMany({
+            where: { userId, googleEventId: item.id },
+          });
+          continue;
+        }
+
+        if (!item.start) continue;
 
         const isAllDay = !item.start.dateTime;
         const startIso = item.start.dateTime || item.start.date;
@@ -444,9 +497,68 @@ export async function autoSyncTwoWay(
         const startTime = isAllDay ? null : startDateObj;
         const endTime = item.end?.dateTime ? new Date(item.end.dateTime) : null;
 
-        const existing = await prisma.dailyActivity.findFirst({
+        let existing = await prisma.dailyActivity.findFirst({
           where: { userId, googleEventId: item.id },
         });
+
+        // Cek juga base ID jika item.id memiliki suffix recurrence (_...) tapi HANYA pada tanggal yang sama
+        if (!existing && item.id.includes('_')) {
+          const baseId = item.id.split('_')[0];
+          existing = await prisma.dailyActivity.findFirst({
+            where: {
+              userId,
+              googleEventId: baseId,
+              date: dateOnly,
+            },
+          });
+        }
+
+        // Jika belum ada berdasarkan googleEventId, cari aktivitas lokal dengan judul dan rentang waktu yang sama
+        if (!existing) {
+          const summaryTitle = (item.summary || '').trim();
+          const cleanTitle = summaryTitle.replace(/[()]/g, '').trim().toLowerCase();
+
+          // Cari aktivitas lokal di sekitar jam/tanggal ini
+          const dayCandidates = await prisma.dailyActivity.findMany({
+            where: {
+              userId,
+              ...(startTime
+                ? {
+                    startTime: {
+                      gte: new Date(startTime.getTime() - 20 * 60000),
+                      lte: new Date(startTime.getTime() + 20 * 60000),
+                    },
+                  }
+                : {
+                    date: {
+                      gte: new Date(dateOnly.getTime() - 86400000),
+                      lte: new Date(dateOnly.getTime() + 86400000),
+                    },
+                  }),
+            },
+          });
+
+          const matchedLocal = dayCandidates.find((cand) => {
+            const candTitle = (cand.title || '').trim().replace(/[()]/g, '').trim().toLowerCase();
+            if (candTitle === 'tanpa judul' && cleanTitle === 'tanpa judul') {
+              return true;
+            }
+            if (candTitle && cleanTitle && candTitle === cleanTitle) {
+              return true;
+            }
+            return false;
+          });
+
+          if (matchedLocal) {
+            existing = matchedLocal;
+            if (!matchedLocal.googleEventId || matchedLocal.googleEventId !== item.id) {
+              await prisma.dailyActivity.update({
+                where: { id: matchedLocal.id },
+                data: { googleEventId: item.id },
+              });
+            }
+          }
+        }
 
         if (existing) {
           // Jika event Google tidak punya dateTime (isAllDay) tapi di lokal sudah punya waktu, jangan hapus jam lokal
@@ -455,7 +567,7 @@ export async function autoSyncTwoWay(
             ? new Date(item.end.dateTime)
             : (!isAllDay ? null : (existing.endTime ?? null));
 
-          // Perbarui data jika ada perubahan di Google Calendar
+          // Perbarui data jika ada perubahan di Google Calendar, pastikan googleEventId spesifik tersimpan
           await prisma.dailyActivity.update({
             where: { id: existing.id },
             data: {
@@ -464,6 +576,7 @@ export async function autoSyncTwoWay(
               date: dateOnly,
               startTime: finalStartTime,
               endTime: finalEndTime,
+              googleEventId: item.id,
             },
           });
         } else {
@@ -559,9 +672,16 @@ export async function importEvents(req: Request, res: Response) {
 
   for (const item of body.events) {
     // Hindari duplikasi jika sudah ada dengan googleEventId yang sama
-    const existing = await prisma.dailyActivity.findFirst({
+    let existing = await prisma.dailyActivity.findFirst({
       where: { userId: req.userId, googleEventId: item.id },
     });
+
+    if (!existing && item.id.includes('_')) {
+      const baseId = item.id.split('_')[0];
+      existing = await prisma.dailyActivity.findFirst({
+        where: { userId: req.userId, googleEventId: baseId },
+      });
+    }
 
     if (existing) continue;
 
@@ -574,6 +694,50 @@ export async function importEvents(req: Request, res: Response) {
     const hasTime = item.start.includes('T');
     const startTime = hasTime ? startDate : null;
     const endTime = item.end && item.end.includes('T') ? new Date(item.end) : null;
+
+    // Hindari duplikasi dengan kegiatan lokal yang memiliki judul dan rentang waktu yang sama
+    const summaryTitle = (item.title || '').trim();
+    const cleanTitle = summaryTitle.replace(/[()]/g, '').trim().toLowerCase();
+
+    const candidates = await prisma.dailyActivity.findMany({
+      where: {
+        userId: req.userId,
+        ...(startTime
+          ? {
+              startTime: {
+                gte: new Date(startTime.getTime() - 20 * 60000),
+                lte: new Date(startTime.getTime() + 20 * 60000),
+              },
+            }
+          : {
+              date: {
+                gte: new Date(dateOnly.getTime() - 86400000),
+                lte: new Date(dateOnly.getTime() + 86400000),
+              },
+            }),
+      },
+    });
+
+    const duplicateMatch = candidates.find((cand) => {
+      const candTitle = (cand.title || '').trim().replace(/[()]/g, '').trim().toLowerCase();
+      if (candTitle === 'tanpa judul' && cleanTitle === 'tanpa judul') {
+        return true;
+      }
+      if (candTitle && cleanTitle && candTitle === cleanTitle) {
+        return true;
+      }
+      return false;
+    });
+
+    if (duplicateMatch) {
+      if (!duplicateMatch.googleEventId) {
+        await prisma.dailyActivity.update({
+          where: { id: duplicateMatch.id },
+          data: { googleEventId: item.id },
+        });
+      }
+      continue;
+    }
 
     await prisma.dailyActivity.create({
       data: {
@@ -625,30 +789,34 @@ export async function updateEvent(req: Request, res: Response) {
   const hasStartTime = Boolean(body.startTime && !isNaN(new Date(body.startTime).getTime()));
   const hasEndTime = Boolean(body.endTime && !isNaN(new Date(body.endTime).getTime()));
 
-  let startPayload: { dateTime?: string; date?: string } = {};
-  let endPayload: { dateTime?: string; date?: string } = {};
+  let startPayload: { dateTime?: string | null; date?: string | null } = {};
+  let endPayload: { dateTime?: string | null; date?: string | null } = {};
+
+  let startIso: string | undefined;
+  let endIso: string | undefined;
+  let startStr: string | undefined;
+  let endStr: string | undefined;
 
   if (hasStartTime) {
-    const startIso = new Date(body.startTime!).toISOString();
-    let endIso: string;
+    startIso = new Date(body.startTime!).toISOString();
     if (hasEndTime && new Date(body.endTime!).getTime() > new Date(body.startTime!).getTime()) {
       endIso = new Date(body.endTime!).toISOString();
     } else {
       endIso = new Date(new Date(body.startTime!).getTime() + 3600_000).toISOString();
     }
-    startPayload = { dateTime: startIso };
-    endPayload = { dateTime: endIso };
+    startPayload = { dateTime: startIso, date: null };
+    endPayload = { dateTime: endIso, date: null };
   } else if (body.date) {
     const baseDate = new Date(body.date);
     const validDate = isNaN(baseDate.getTime()) ? new Date() : baseDate;
-    const startStr = validDate.toISOString().split('T')[0];
+    startStr = validDate.toISOString().split('T')[0];
 
     const nextDate = new Date(validDate);
     nextDate.setUTCDate(nextDate.getUTCDate() + 1);
-    const endStr = nextDate.toISOString().split('T')[0];
+    endStr = nextDate.toISOString().split('T')[0];
 
-    startPayload = { date: startStr };
-    endPayload = { date: endStr };
+    startPayload = { date: startStr, dateTime: null };
+    endPayload = { date: endStr, dateTime: null };
   }
 
   const eventPayload: Record<string, unknown> = {};
@@ -658,7 +826,7 @@ export async function updateEvent(req: Request, res: Response) {
   if (endPayload.dateTime !== undefined || endPayload.date !== undefined) eventPayload.end = endPayload;
 
   try {
-    const gRes = await fetch(
+    let gRes = await fetch(
       `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(eventId)}`,
       {
         method: 'PATCH',
@@ -669,6 +837,25 @@ export async function updateEvent(req: Request, res: Response) {
         body: JSON.stringify(eventPayload),
       },
     );
+
+    if (gRes.status === 400 || gRes.status === 404 || gRes.status === 410) {
+      const cleanStart = hasStartTime ? { dateTime: startIso } : { date: startStr };
+      const cleanEnd = hasStartTime ? { dateTime: endIso } : { date: endStr };
+      const postPayload: Record<string, unknown> = {
+        summary: body.title || 'Tanpa judul',
+        description: body.description || undefined,
+        start: cleanStart,
+        end: cleanEnd,
+      };
+      gRes = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${tokenResult.accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(postPayload),
+      });
+    }
 
     if (!gRes.ok) {
       const errText = await gRes.text();
@@ -743,3 +930,81 @@ export async function deleteEvent(req: Request, res: Response) {
 
   return res.json({ success: true, data: { id: eventId } });
 }
+
+// ============ Create Google Calendar Event ============
+const createEventSchema = z.object({
+  title: z.string().min(1),
+  description: z.string().nullable().optional(),
+  date: z.string().optional(),
+  startTime: z.string().nullable().optional(),
+  endTime: z.string().nullable().optional(),
+});
+
+export async function createEvent(req: Request, res: Response) {
+  if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
+  const tokenResult = await getValidUserToken(req.userId);
+  if ('error' in tokenResult) {
+    return sendError(res, tokenResult.code, tokenResult.error);
+  }
+
+  const body = createEventSchema.parse(req.body);
+  const hasStartTime = Boolean(body.startTime && !isNaN(new Date(body.startTime).getTime()));
+  const hasEndTime = Boolean(body.endTime && !isNaN(new Date(body.endTime).getTime()));
+
+  let startIso: string | undefined;
+  let endIso: string | undefined;
+  let startStr: string | undefined;
+  let endStr: string | undefined;
+
+  if (hasStartTime) {
+    startIso = new Date(body.startTime!).toISOString();
+    if (hasEndTime && new Date(body.endTime!).getTime() > new Date(body.startTime!).getTime()) {
+      endIso = new Date(body.endTime!).toISOString();
+    } else {
+      endIso = new Date(new Date(body.startTime!).getTime() + 3600_000).toISOString();
+    }
+  } else if (body.date) {
+    const baseDate = new Date(body.date);
+    const validDate = isNaN(baseDate.getTime()) ? new Date() : baseDate;
+    startStr = validDate.toISOString().split('T')[0];
+
+    const nextDate = new Date(validDate);
+    nextDate.setUTCDate(nextDate.getUTCDate() + 1);
+    endStr = nextDate.toISOString().split('T')[0];
+  } else {
+    return sendError(res, 400, 'Waktu mulai atau tanggal wajib diisi.');
+  }
+
+  const postPayload = {
+    summary: body.title,
+    description: body.description || undefined,
+    start: hasStartTime ? { dateTime: startIso } : { date: startStr },
+    end: hasStartTime ? { dateTime: endIso } : { date: endStr },
+  };
+
+  try {
+    const gRes = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${tokenResult.accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(postPayload),
+    });
+
+    if (!gRes.ok) {
+      const errText = await gRes.text();
+      console.error('[googleCalendar] createEvent error:', errText);
+      return sendError(res, 502, 'Gagal membuat event di Google Calendar.');
+    }
+
+    const created = (await gRes.json()) as { id: string };
+    emitToUser(req.userId, 'calendar:synced', { action: 'create', eventId: created.id });
+
+    return res.status(201).json({ success: true, data: { id: created.id } });
+  } catch (err) {
+    console.error('[googleCalendar] createEvent exception:', err);
+    return sendError(res, 500, 'Terjadi kesalahan saat membuat event Google.');
+  }
+}
+

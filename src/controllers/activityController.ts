@@ -123,9 +123,11 @@ const createActivitySchema = z.object({
   startTime: z.string().datetime().optional().or(z.string().optional()),
   endTime: z.string().datetime().optional().or(z.string().optional()),
   type: z.enum(['TASK', 'BREAKDOWN', 'CUSTOM']).default('CUSTOM'),
+  status: z.enum(['PENDING', 'COMPLETED', 'SKIPPED']).optional(),
   taskId: z.string().optional(),
   icon: z.string().max(8).optional(),
   order: z.number().optional(),
+  createdAt: z.string().datetime().optional().or(z.string().optional()),
   customValues: z.record(z.union([z.string(), z.number(), z.boolean()])).nullable().optional(),
   checklist: z
     .array(z.object({ text: z.string().min(1) }))
@@ -148,6 +150,8 @@ export async function createActivity(req: Request, res: Response) {
   const date = parseOptionalDate(body.date) as Date | undefined;
   if (!date) return sendError(res, 422, 'Format tanggal tidak valid');
 
+  const createdAtDate = parseOptionalDate(body.createdAt);
+
   const activity = await prisma.dailyActivity.create({
     data: {
       userId: req.userId,
@@ -157,9 +161,11 @@ export async function createActivity(req: Request, res: Response) {
       startTime: parseOptionalDate(body.startTime) ?? null,
       endTime: parseOptionalDate(body.endTime) ?? null,
       type: body.type,
+      status: body.status ?? 'PENDING',
       taskId: body.taskId,
       icon: body.icon,
       order: body.order ?? 0,
+      createdAt: createdAtDate ?? undefined,
       customValues: (body.customValues ?? undefined) as unknown as Prisma.InputJsonValue | undefined,
       checklistItems: body.checklist
         ? {
@@ -176,12 +182,21 @@ export async function createActivity(req: Request, res: Response) {
     },
   });
 
-  // Otomatis sinkronkan ke Google Calendar jika akun terhubung
-  void pushActivityToGoogleCalendar(req.userId, activity.id).catch((err) => {
-    console.error('[activityController] Gagal auto-push ke Google Calendar:', err);
-  });
+  // Otomatis sinkronkan ke Google Calendar jika akun terhubung dan aktivitas memiliki jam pelaksanaan
+  if (activity.startTime) {
+    try {
+      const gId = await pushActivityToGoogleCalendar(req.userId, activity.id);
+      if (gId) activity.googleEventId = gId;
+    } catch (err) {
+      console.error('[activityController] Gagal auto-push ke Google Calendar:', err);
+    }
 
-  emitToUser(req.userId, 'calendar:synced', { action: 'create', activityId: activity.id });
+    emitToUser(req.userId, 'calendar:synced', {
+      action: 'create',
+      activityId: activity.id,
+      googleEventId: activity.googleEventId,
+    });
+  }
 
   return res.status(201).json({ success: true, data: activity });
 }
@@ -237,12 +252,19 @@ export async function updateActivity(req: Request, res: Response) {
     },
   });
 
-  // Otomatis sinkronkan pembaruan ke Google Calendar jika terhubung
-  void pushActivityToGoogleCalendar(req.userId, activity.id).catch((err) => {
+  // Otomatis sinkronkan pembaruan ke Google Calendar jika terhubung (tunggu agar googleEventId langsung tersedia)
+  try {
+    const gId = await pushActivityToGoogleCalendar(req.userId, activity.id);
+    if (gId) activity.googleEventId = gId;
+  } catch (err) {
     console.error('[activityController] Gagal auto-update ke Google Calendar:', err);
-  });
+  }
 
-  emitToUser(req.userId, 'calendar:synced', { action: 'update', activityId: activity.id });
+  emitToUser(req.userId, 'calendar:synced', {
+    action: 'update',
+    activityId: activity.id,
+    googleEventId: activity.googleEventId,
+  });
 
   return res.json({ success: true, data: activity });
 }
@@ -257,16 +279,25 @@ export async function deleteActivity(req: Request, res: Response) {
   });
   if (!existing) return sendError(res, 404, 'Aktivitas tidak ditemukan');
 
-  // Bersihkan event Google Calendar di latar belakang jika tertaut
+  // Bersihkan event Google Calendar jika tertaut (tunggu agar tuntas di Google sebelum lanjut)
   if (existing.googleEventId) {
-    void deleteEventFromGoogleCalendar(req.userId, existing.googleEventId).catch((err) => {
+    try {
+      await deleteEventFromGoogleCalendar(req.userId, existing.googleEventId);
+    } catch (err) {
       console.error('[activityController] Gagal auto-delete dari Google Calendar:', err);
-    });
+    }
   }
 
   await prisma.dailyActivity.delete({ where: { id: req.params.activityId } });
-  emitToUser(req.userId, 'calendar:synced', { action: 'delete', activityId: req.params.activityId });
-  return res.json({ success: true, data: { id: req.params.activityId } });
+  emitToUser(req.userId, 'calendar:synced', {
+    action: 'delete',
+    activityId: req.params.activityId,
+    googleEventId: existing.googleEventId,
+  });
+  return res.json({
+    success: true,
+    data: { id: req.params.activityId, googleEventId: existing.googleEventId },
+  });
 }
 
 // ============ Checklist block (Notion-style sub-todos) ============
