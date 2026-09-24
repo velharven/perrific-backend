@@ -14,5 +14,7 @@ router.get('/google/events', googleCalendarController.listEvents);
 router.post('/google/sync-activity/:activityId', googleCalendarController.syncActivity);
 router.post('/google/import', googleCalendarController.importEvents);
 router.post('/google/auto-sync', googleCalendarController.handleAutoSync);
+router.patch('/google/events/:eventId', googleCalendarController.updateEvent);
+router.delete('/google/events/:eventId', googleCalendarController.deleteEvent);
 
 export default router;

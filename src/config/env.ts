@@ -13,7 +13,7 @@ export const env = {
     .filter(Boolean),
   databaseUrl: process.env.DATABASE_URL ?? '',
   jwtSecret: process.env.JWT_SECRET ?? 'change-me',
-  jwtExpiresIn: process.env.JWT_EXPIRES_IN ?? '7d',
+  jwtExpiresIn: process.env.JWT_EXPIRES_IN ?? '30d',
   bcryptRounds: Number(process.env.BCRYPT_ROUNDS ?? 10),
   googleClientId: process.env.GOOGLE_CLIENT_ID ?? '',
 };

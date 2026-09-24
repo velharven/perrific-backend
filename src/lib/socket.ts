@@ -45,9 +45,17 @@ export function getIO(): SocketServer {
 }
 
 export function emitToUser(userId: string, event: string, data: unknown) {
-  getIO().to(roomNames.user(userId)).emit(event, data);
+  try {
+    getIO().to(roomNames.user(userId)).emit(event, data);
+  } catch (err) {
+    console.warn(`[socket] emitToUser failed for user ${userId}:`, err);
+  }
 }
 
 export function emitToTeam(teamId: string, event: string, data: unknown) {
-  getIO().to(roomNames.team(teamId)).emit(event, data);
+  try {
+    getIO().to(roomNames.team(teamId)).emit(event, data);
+  } catch (err) {
+    console.warn(`[socket] emitToTeam failed for team ${teamId}:`, err);
+  }
 }

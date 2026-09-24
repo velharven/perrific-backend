@@ -4,6 +4,7 @@ import { prisma } from '../lib/prisma';
 import { sendError } from '../lib/errors';
 import { AVATAR_RE, avatarUrlField } from '../lib/avatar';
 import { assigneesInclude, columnSelect, createdBySelect, uniqIds, watchersInclude, withAssignees, withWatchers } from '../lib/taskAssignees';
+import { emitToUser } from '../lib/socket';
 import { can, ensureProjectMember, PERMISSIONS } from '../lib/permissions';
 import type { PermissionKey } from '../lib/permissions';
 
@@ -226,6 +227,13 @@ export async function createTask(req: Request, res: Response) {
         targetUserId: userId,
       })),
     });
+  }
+
+  // Beri tahu socket realtime untuk seluruh penerima tugas (assignees)
+  if (approval === 'APPROVED' && initialIds.length > 0) {
+    for (const userId of initialIds) {
+      emitToUser(userId, 'task:assigned', { taskId: task.id, action: 'ASSIGNED' });
+    }
   }
   // Usulan anggota: beri tahu semua yang bisa approve di project ini.
   if (approval === 'PENDING' && req.userId) {

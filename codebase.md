@@ -183,13 +183,16 @@ Semua rute diawali dengan prefix `/api`.
 - `POST /:taskId/reject`: Menolak usulan tugas yang berstatus PENDING.
 
 ### Integrasi Google Calendar (`/api/calendar`)
-- `GET /auth-url`: Mendapatkan URL otorisasi OAuth 2.0 Google Calendar.
-- `POST /callback`: Menukarkan authorization code Google dengan access token dan refresh token.
-- `GET /status`: Mengambil status koneksi, email, nama, dan foto profil akun Google yang terhubung.
-- `POST /disconnect`: Memutus integrasi Google Calendar dan membersihkan token dari basis data.
-- `GET /events`: Mengambil daftar event kalender Google pengguna dalam rentang waktu tertentu.
-- `POST /sync`: Memicu sinkronisasi dua arah otomatis/manual antara DailyActivity dan Google Calendar.
-- `POST /import`: Mengimpor event Google Calendar menjadi entri DailyActivity lokal.
+- `GET /google/status`: Mengambil status koneksi, email, nama, dan foto profil akun Google yang terhubung.
+- `POST /google/connect`: Menghubungkan akun Google menggunakan access token OAuth.
+- `POST /google/disconnect`: Memutus integrasi Google Calendar dan membersihkan kredensial token dari basis data.
+- `GET /google/events`: Mengambil daftar event kalender Google pengguna dalam rentang waktu tertentu.
+- `POST /google/sync-activity/:activityId`: Memicu sinkronisasi instan satu kegiatan harian spesifik ke Google Calendar.
+- `POST /google/import`: Mengimpor event Google Calendar menjadi entri DailyActivity lokal.
+- `POST /google/auto-sync`: Memicu sinkronisasi dua arah otomatis antara DailyActivity dan Google Calendar.
+- `PATCH /google/events/:eventId`: Memperbarui data event kalender Google (judul, waktu mulai, selesai, deskripsi).
+- `DELETE /google/events/:eventId`: Menghapus event pada Google Calendar dan melepaskan tautan Google event pada DailyActivity lokal.
+- Logika sinkronisasi otomatis: Pembuatan, pembaruan, dan penghapusan `DailyActivity` secara otomatis menyelaraskan event Google Calendar terkait di latar belakang serta menyiarkan event real-time `calendar:synced` (`create`, `update`, `delete`).
 
 ### Aktivitas harian personal (`/api/activities`)
 - `GET /me`: Mengambil daftar aktivitas harian pengguna dengan filter tanggal, pencarian, dan status (didukung buffer zona waktu).

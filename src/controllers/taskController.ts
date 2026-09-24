@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { prisma } from '../lib/prisma';
 import { sendError } from '../lib/errors';
 import { assigneesInclude, columnSelect, createdBySelect, uniqIds, watchersInclude, withAssignees, withWatchers } from '../lib/taskAssignees';
+import { emitToUser } from '../lib/socket';
 import { can } from '../lib/permissions';
 
 export async function getTask(req: Request, res: Response) {
@@ -145,9 +146,18 @@ export async function updateTask(req: Request, res: Response) {
     const newIds = uniqIds(assigneeIds);
     for (const userId of newIds.filter((id) => !oldIds.includes(id))) {
       logs.push({ kind: 'ASSIGNED', targetUserId: userId });
+      emitToUser(userId, 'task:assigned', { taskId: task.id, action: 'ASSIGNED' });
     }
     for (const userId of oldIds.filter((id) => !newIds.includes(id))) {
       logs.push({ kind: 'UNASSIGNED', targetUserId: userId });
+      emitToUser(userId, 'task:assigned', { taskId: task.id, action: 'UNASSIGNED' });
+    }
+    for (const userId of newIds.filter((id) => oldIds.includes(id))) {
+      emitToUser(userId, 'task:assigned', { taskId: task.id, action: 'UPDATED' });
+    }
+  } else if (before) {
+    for (const a of before.assignees) {
+      emitToUser(a.userId, 'task:assigned', { taskId: task.id, action: 'UPDATED' });
     }
   }
   if (logs.length > 0) {
@@ -173,7 +183,14 @@ export async function deleteTask(req: Request, res: Response) {
       return sendError(res, 403, 'Hanya yang berhak yang bisa menghapus task');
     }
   }
+  const taskBefore = await prisma.task.findUnique({
+    where: { id: req.params.taskId },
+    select: { assignees: { select: { userId: true } } },
+  });
   await prisma.task.delete({ where: { id: req.params.taskId } });
+  for (const a of taskBefore?.assignees ?? []) {
+    emitToUser(a.userId, 'task:assigned', { taskId: req.params.taskId, action: 'UNASSIGNED' });
+  }
   return res.json({ success: true, data: { id: req.params.taskId } });
 }
 
@@ -427,6 +444,15 @@ async function decideApproval(req: Request, res: Response, approval: 'APPROVED' 
       })),
     });
   }
+
+  // Beritahu realtime socket ke seluruh assignee
+  for (const a of task.assignees) {
+    emitToUser(a.user.id, 'task:assigned', {
+      taskId: task.id,
+      action: approval === 'APPROVED' ? 'ASSIGNED' : 'UNASSIGNED',
+    });
+  }
+
   return res.json({ success: true, data: withWatchers(withAssignees(task)) });
 }
 

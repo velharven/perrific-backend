@@ -234,19 +234,37 @@ export async function pushActivityToGoogleCalendar(userId: string, activityId: s
   });
   if (!activity) return null;
 
-  const dateStr = activity.date.toISOString().split('T')[0];
+  const hasValidStartTime = activity.startTime && !isNaN(activity.startTime.getTime());
+  const hasValidEndTime = activity.endTime && !isNaN(activity.endTime.getTime());
 
   let startPayload: { dateTime?: string; date?: string };
   let endPayload: { dateTime?: string; date?: string };
 
-  if (activity.startTime) {
-    startPayload = { dateTime: activity.startTime.toISOString() };
-    endPayload = activity.endTime
-      ? { dateTime: activity.endTime.toISOString() }
-      : { dateTime: new Date(activity.startTime.getTime() + 3600_000).toISOString() };
+  if (hasValidStartTime) {
+    const startIso = activity.startTime!.toISOString();
+    let endIso: string;
+    if (hasValidEndTime && activity.endTime!.getTime() > activity.startTime!.getTime()) {
+      endIso = activity.endTime!.toISOString();
+    } else {
+      endIso = new Date(activity.startTime!.getTime() + 3600_000).toISOString();
+    }
+    startPayload = { dateTime: startIso };
+    endPayload = { dateTime: endIso };
   } else {
-    startPayload = { date: dateStr };
-    endPayload = { date: dateStr };
+    // Untuk event sepanjang hari (all-day), Google Calendar API mewajibkan:
+    // 1. Format tanggal YYYY-MM-DD
+    // 2. end.date bersifat EKSKLUSIF (harus minimal 1 hari setelah start.date).
+    // Jika start.date sama dengan end.date, Google akan menolak dengan error 400 "Invalid start time."
+    const startDate = new Date(activity.date);
+    const baseDate = isNaN(startDate.getTime()) ? new Date() : startDate;
+    const startStr = baseDate.toISOString().split('T')[0];
+
+    const nextDate = new Date(baseDate);
+    nextDate.setUTCDate(nextDate.getUTCDate() + 1);
+    const endStr = nextDate.toISOString().split('T')[0];
+
+    startPayload = { date: startStr };
+    endPayload = { date: endStr };
   }
 
   let description = activity.description || '';
@@ -278,6 +296,18 @@ export async function pushActivityToGoogleCalendar(userId: string, activityId: s
           body: JSON.stringify(eventPayload),
         },
       );
+
+      // Jika event di Google Calendar sudah tidak ada (404), buat ulang via POST
+      if (gRes.status === 404) {
+        gRes = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${tokenResult.accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(eventPayload),
+        });
+      }
     } else {
       gRes = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
         method: 'POST',
@@ -297,7 +327,7 @@ export async function pushActivityToGoogleCalendar(userId: string, activityId: s
 
     const createdEvent = (await gRes.json()) as { id: string };
 
-    if (!isUpdate && createdEvent.id) {
+    if (createdEvent.id && createdEvent.id !== activity.googleEventId) {
       await prisma.dailyActivity.update({
         where: { id: activity.id },
         data: { googleEventId: createdEvent.id },
@@ -419,6 +449,12 @@ export async function autoSyncTwoWay(
         });
 
         if (existing) {
+          // Jika event Google tidak punya dateTime (isAllDay) tapi di lokal sudah punya waktu, jangan hapus jam lokal
+          const finalStartTime = !isAllDay ? startDateObj : (existing.startTime ?? null);
+          const finalEndTime = item.end?.dateTime
+            ? new Date(item.end.dateTime)
+            : (!isAllDay ? null : (existing.endTime ?? null));
+
           // Perbarui data jika ada perubahan di Google Calendar
           await prisma.dailyActivity.update({
             where: { id: existing.id },
@@ -426,8 +462,8 @@ export async function autoSyncTwoWay(
               title: item.summary || existing.title,
               description: item.description !== undefined ? item.description : existing.description,
               date: dateOnly,
-              startTime,
-              endTime,
+              startTime: finalStartTime,
+              endTime: finalEndTime,
             },
           });
         } else {
@@ -565,4 +601,145 @@ export async function importEvents(req: Request, res: Response) {
     success: true,
     data: { importedCount },
   });
+}
+
+// ============ Update Google Calendar Event ============
+const updateEventSchema = z.object({
+  title: z.string().min(1).optional(),
+  description: z.string().nullable().optional(),
+  date: z.string().optional(),
+  startTime: z.string().nullable().optional(),
+  endTime: z.string().nullable().optional(),
+});
+
+export async function updateEvent(req: Request, res: Response) {
+  if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
+  const tokenResult = await getValidUserToken(req.userId);
+  if ('error' in tokenResult) {
+    return sendError(res, tokenResult.code, tokenResult.error);
+  }
+
+  const eventId = req.params.eventId;
+  const body = updateEventSchema.parse(req.body);
+
+  const hasStartTime = Boolean(body.startTime && !isNaN(new Date(body.startTime).getTime()));
+  const hasEndTime = Boolean(body.endTime && !isNaN(new Date(body.endTime).getTime()));
+
+  let startPayload: { dateTime?: string; date?: string } = {};
+  let endPayload: { dateTime?: string; date?: string } = {};
+
+  if (hasStartTime) {
+    const startIso = new Date(body.startTime!).toISOString();
+    let endIso: string;
+    if (hasEndTime && new Date(body.endTime!).getTime() > new Date(body.startTime!).getTime()) {
+      endIso = new Date(body.endTime!).toISOString();
+    } else {
+      endIso = new Date(new Date(body.startTime!).getTime() + 3600_000).toISOString();
+    }
+    startPayload = { dateTime: startIso };
+    endPayload = { dateTime: endIso };
+  } else if (body.date) {
+    const baseDate = new Date(body.date);
+    const validDate = isNaN(baseDate.getTime()) ? new Date() : baseDate;
+    const startStr = validDate.toISOString().split('T')[0];
+
+    const nextDate = new Date(validDate);
+    nextDate.setUTCDate(nextDate.getUTCDate() + 1);
+    const endStr = nextDate.toISOString().split('T')[0];
+
+    startPayload = { date: startStr };
+    endPayload = { date: endStr };
+  }
+
+  const eventPayload: Record<string, unknown> = {};
+  if (body.title) eventPayload.summary = body.title;
+  if (body.description !== undefined) eventPayload.description = body.description;
+  if (startPayload.dateTime !== undefined || startPayload.date !== undefined) eventPayload.start = startPayload;
+  if (endPayload.dateTime !== undefined || endPayload.date !== undefined) eventPayload.end = endPayload;
+
+  try {
+    const gRes = await fetch(
+      `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(eventId)}`,
+      {
+        method: 'PATCH',
+        headers: {
+          Authorization: `Bearer ${tokenResult.accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(eventPayload),
+      },
+    );
+
+    if (!gRes.ok) {
+      const errText = await gRes.text();
+      console.error('[googleCalendar] updateEvent gagal:', errText);
+      return sendError(res, 502, 'Gagal memperbarui event di Google Calendar.');
+    }
+
+    // Periksa apakah ada DailyActivity lokal yang tertaut
+    const existing = await prisma.dailyActivity.findFirst({
+      where: { userId: req.userId, googleEventId: eventId },
+    });
+
+    const actDate = body.date
+      ? new Date(body.date)
+      : hasStartTime
+        ? new Date(body.startTime!)
+        : new Date();
+    actDate.setHours(0, 0, 0, 0);
+
+    if (existing) {
+      await prisma.dailyActivity.update({
+        where: { id: existing.id },
+        data: {
+          title: body.title || existing.title,
+          description: body.description !== undefined ? body.description : existing.description,
+          date: actDate,
+          startTime: hasStartTime ? new Date(body.startTime!) : null,
+          endTime: hasEndTime ? new Date(body.endTime!) : null,
+        },
+      });
+    } else {
+      await prisma.dailyActivity.create({
+        data: {
+          userId: req.userId,
+          title: body.title || '(Tanpa judul)',
+          description: body.description || null,
+          date: actDate,
+          startTime: hasStartTime ? new Date(body.startTime!) : null,
+          endTime: hasEndTime ? new Date(body.endTime!) : null,
+          type: 'CUSTOM',
+          status: 'PENDING',
+          googleEventId: eventId,
+        },
+      });
+    }
+
+    emitToUser(req.userId, 'calendar:synced', { action: 'update', eventId });
+
+    return res.json({ success: true, data: { id: eventId } });
+  } catch (err) {
+    console.error('[googleCalendar] updateEvent exception:', err);
+    return sendError(res, 500, 'Terjadi kesalahan saat memperbarui event Google.');
+  }
+}
+
+// ============ Delete Google Calendar Event ============
+export async function deleteEvent(req: Request, res: Response) {
+  if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
+  const eventId = req.params.eventId;
+
+  const success = await deleteEventFromGoogleCalendar(req.userId, eventId);
+  if (!success) {
+    return sendError(res, 502, 'Gagal menghapus event dari Google Calendar.');
+  }
+
+  // Hapus DailyActivity lokal jika ada
+  await prisma.dailyActivity.deleteMany({
+    where: { userId: req.userId, googleEventId: eventId },
+  });
+
+  emitToUser(req.userId, 'calendar:synced', { action: 'delete', eventId });
+
+  return res.json({ success: true, data: { id: eventId } });
 }
