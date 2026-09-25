@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { prisma } from '../lib/prisma';
 import { sendError } from '../lib/errors';
 import { emitToUser } from '../lib/socket';
+import { withUserCalendarLock } from '../lib/calendarOperationLock';
 
 interface GoogleTokenInfo {
   aud?: string;
@@ -24,8 +25,85 @@ interface GoogleCalendarEventItem {
   location?: string;
   htmlLink?: string;
   status?: string;
+  recurrence?: string[];
+  recurringEventId?: string;
+  originalStartTime?: { dateTime?: string; date?: string };
   start?: { dateTime?: string; date?: string };
   end?: { dateTime?: string; date?: string };
+}
+
+class GoogleCalendarListError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
+async function listGoogleEventItems(accessToken: string, timeMin: string, timeMax: string, maxResults: number) {
+  const url = new URL('https://www.googleapis.com/calendar/v3/calendars/primary/events');
+  url.searchParams.set('timeMin', timeMin);
+  url.searchParams.set('timeMax', timeMax);
+  url.searchParams.set('singleEvents', 'true');
+  url.searchParams.set('showDeleted', 'true');
+  url.searchParams.set('orderBy', 'startTime');
+  url.searchParams.set('maxResults', String(maxResults));
+
+  const items: GoogleCalendarEventItem[] = [];
+  let pageToken: string | undefined;
+  do {
+    if (pageToken) url.searchParams.set('pageToken', pageToken);
+    const response = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!response.ok) {
+      throw new GoogleCalendarListError(response.status, await response.text());
+    }
+    const page = (await response.json()) as {
+      items?: GoogleCalendarEventItem[];
+      nextPageToken?: string;
+    };
+    items.push(...(page.items ?? []));
+    pageToken = page.nextPageToken;
+  } while (pageToken);
+
+  return items;
+}
+
+async function findRecurringInstanceForActivity(
+  accessToken: string,
+  parentId: string,
+  date: Date,
+  startTime: Date | null,
+): Promise<GoogleCalendarEventItem | null> {
+  const reference = startTime ?? date;
+  const url = new URL(`https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(parentId)}/instances`);
+  url.searchParams.set('timeMin', new Date(reference.getTime() - 2 * 86400000).toISOString());
+  url.searchParams.set('timeMax', new Date(reference.getTime() + 2 * 86400000).toISOString());
+  url.searchParams.set('showDeleted', 'true');
+  url.searchParams.set('maxResults', '250');
+  const instances: GoogleCalendarEventItem[] = [];
+  let pageToken: string | undefined;
+  do {
+    if (pageToken) url.searchParams.set('pageToken', pageToken);
+    const response = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!response.ok) throw new GoogleCalendarListError(response.status, await response.text());
+    const page = (await response.json()) as { items?: GoogleCalendarEventItem[]; nextPageToken?: string };
+    instances.push(...(page.items ?? []));
+    pageToken = page.nextPageToken;
+  } while (pageToken);
+
+  const maxDifference = startTime ? 60000 : 12 * 3600000;
+  return instances
+    .map((item) => ({
+      item,
+      difference: Math.abs(new Date(
+        item.start?.dateTime || item.start?.date ||
+        item.originalStartTime?.dateTime || item.originalStartTime?.date || '',
+      ).getTime() - reference.getTime()),
+    }))
+    .filter(({ difference }) => Number.isFinite(difference) && difference <= maxDifference)
+    .sort((a, b) => a.difference - b.difference)[0]?.item ?? null;
 }
 
 async function getValidUserToken(userId: string): Promise<{ accessToken: string } | { error: string; code: number }> {
@@ -182,33 +260,20 @@ export async function listEvents(req: Request, res: Response) {
     timeMax = end.toISOString();
   }
 
-  const url = new URL('https://www.googleapis.com/calendar/v3/calendars/primary/events');
-  url.searchParams.set('timeMin', timeMin);
-  url.searchParams.set('timeMax', timeMax);
-  url.searchParams.set('singleEvents', 'true');
-  url.searchParams.set('orderBy', 'startTime');
-  url.searchParams.set('maxResults', '250');
-
-  const gRes = await fetch(url.toString(), {
-    headers: { Authorization: `Bearer ${tokenResult.accessToken}` },
-  });
-
-  if (gRes.status === 401) {
-    await prisma.user.update({
-      where: { id: req.userId },
-      data: { googleCalendarConnected: false, googleCalendarAccessToken: null },
-    });
-    return sendError(res, 401, 'Sesi Google Calendar telah kedaluwarsa. Silakan hubungkan ulang.');
-  }
-
-  if (!gRes.ok) {
-    const errText = await gRes.text();
-    console.error('[googleCalendar] gagal mengambil event:', errText);
+  let items: GoogleCalendarEventItem[];
+  try {
+    items = await listGoogleEventItems(tokenResult.accessToken, timeMin, timeMax, 250);
+  } catch (error) {
+    if (error instanceof GoogleCalendarListError && error.status === 401) {
+      await prisma.user.update({
+        where: { id: req.userId },
+        data: { googleCalendarConnected: false, googleCalendarAccessToken: null },
+      });
+      return sendError(res, 401, 'Sesi Google Calendar telah kedaluwarsa. Silakan hubungkan ulang.');
+    }
+    console.error('[googleCalendar] gagal mengambil event:', error);
     return sendError(res, 502, 'Gagal mengambil event dari Google Calendar.');
   }
-
-  const gData = (await gRes.json()) as { items?: GoogleCalendarEventItem[] };
-  const items = gData.items ?? [];
 
   const formatted = items
     .filter((item) => item.status !== 'cancelled' && Boolean(item.start?.dateTime || item.start?.date))
@@ -390,13 +455,36 @@ export async function pushActivityToGoogleCalendar(userId: string, activityId: s
 }
 
 // ============ Helper: Hapus Event di Google Calendar ============
-export async function deleteEventFromGoogleCalendar(userId: string, googleEventId: string): Promise<boolean> {
+export async function deleteEventFromGoogleCalendar(
+  userId: string,
+  googleEventId: string,
+  occurrence?: { date: Date; startTime: Date | null },
+): Promise<boolean> {
   const tokenResult = await getValidUserToken(userId);
   if ('error' in tokenResult) return false;
 
   try {
+    let eventId = googleEventId;
+    if (occurrence) {
+      const lookup = await fetch(
+        `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(googleEventId)}`,
+        { headers: { Authorization: `Bearer ${tokenResult.accessToken}` } },
+      );
+      if (lookup.status === 404 || lookup.status === 410) return true;
+      if (!lookup.ok) return false;
+      const linkedEvent = (await lookup.json()) as GoogleCalendarEventItem;
+      if (linkedEvent.status === 'cancelled') return true;
+      if (linkedEvent.recurrence?.length) {
+        const instance = await findRecurringInstanceForActivity(
+          tokenResult.accessToken, googleEventId, occurrence.date, occurrence.startTime,
+        );
+        if (!instance) return false;
+        if (instance.status === 'cancelled') return true;
+        eventId = instance.id;
+      }
+    }
     const res = await fetch(
-      `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(googleEventId)}`,
+      `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(eventId)}`,
       {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${tokenResult.accessToken}` },
@@ -411,6 +499,14 @@ export async function deleteEventFromGoogleCalendar(userId: string, googleEventI
 
 // ============ Helper: Sinkronisasi 2 Arah Otomatis ============
 export async function autoSyncTwoWay(
+  userId: string,
+  startDateStr?: string,
+  endDateStr?: string,
+): Promise<{ pushedCount: number; importedCount: number }> {
+  return withUserCalendarLock(userId, () => autoSyncTwoWayUnlocked(userId, startDateStr, endDateStr));
+}
+
+async function autoSyncTwoWayUnlocked(
   userId: string,
   startDateStr?: string,
   endDateStr?: string,
@@ -456,20 +552,13 @@ export async function autoSyncTwoWay(
   // 2. Tarik event dari Google Calendar API
   let importedCount = 0;
   try {
-    const url = new URL('https://www.googleapis.com/calendar/v3/calendars/primary/events');
-    url.searchParams.set('timeMin', startDate.toISOString());
-    url.searchParams.set('timeMax', endDate.toISOString());
-    url.searchParams.set('singleEvents', 'true');
-    url.searchParams.set('orderBy', 'startTime');
-    url.searchParams.set('maxResults', '150');
-
-    const gRes = await fetch(url.toString(), {
-      headers: { Authorization: `Bearer ${tokenResult.accessToken}` },
-    });
-
-    if (gRes.ok) {
-      const gData = (await gRes.json()) as { items?: GoogleCalendarEventItem[] };
-      const items = gData.items ?? [];
+    const items = await listGoogleEventItems(
+      tokenResult.accessToken,
+      startDate.toISOString(),
+      endDate.toISOString(),
+      150,
+    );
+    const activeEventIds = new Set(items.filter((item) => item.status !== 'cancelled').map((item) => item.id));
 
       for (const item of items) {
         if (!item.id) continue;
@@ -597,9 +686,69 @@ export async function autoSyncTwoWay(
           importedCount++;
         }
       }
+
+    // Event yang dihapus langsung di Google biasanya hilang dari daftar biasa.
+    // Periksa ID lokal yang tidak terlihat sebelum menghapusnya: event bisa saja
+    // hanya dipindah ke tanggal di luar rentang yang sedang disinkronkan.
+    const linkedActivities = await prisma.dailyActivity.findMany({
+      where: {
+        userId,
+        googleEventId: { not: null },
+        date: { gte: startDate, lte: endDate },
+      },
+    });
+    for (const activity of linkedActivities) {
+      const eventId = activity.googleEventId;
+      if (!eventId || activeEventIds.has(eventId)) continue;
+      try {
+        const response = await fetch(
+          `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(eventId)}`,
+          { headers: { Authorization: `Bearer ${tokenResult.accessToken}` } },
+        );
+        if (response.status === 404 || response.status === 410) {
+          await prisma.dailyActivity.deleteMany({
+            where: { id: activity.id, userId, googleEventId: eventId },
+          });
+          continue;
+        }
+        if (!response.ok) {
+          console.error('[googleCalendar] gagal memeriksa event yang hilang:', response.status, eventId);
+          continue;
+        }
+        const event = (await response.json()) as GoogleCalendarEventItem;
+        const occurrence = event.recurrence?.length
+          ? await findRecurringInstanceForActivity(tokenResult.accessToken, eventId, activity.date, activity.startTime)
+          : event;
+        if (!occurrence) continue;
+        if (occurrence.status === 'cancelled') {
+          await prisma.dailyActivity.deleteMany({
+            where: { id: activity.id, userId, googleEventId: eventId },
+          });
+          continue;
+        }
+        const movedStart = occurrence.start?.dateTime || occurrence.start?.date;
+        if (!movedStart) continue;
+        const movedDate = new Date(movedStart);
+        if (isNaN(movedDate.getTime())) continue;
+        movedDate.setHours(0, 0, 0, 0);
+        await prisma.dailyActivity.updateMany({
+          where: { id: activity.id, userId, googleEventId: eventId },
+          data: {
+            title: occurrence.summary || activity.title,
+            description: occurrence.description !== undefined ? occurrence.description : activity.description,
+            date: movedDate,
+            startTime: occurrence.start?.dateTime ? new Date(occurrence.start.dateTime) : null,
+            endTime: occurrence.end?.dateTime ? new Date(occurrence.end.dateTime) : null,
+            googleEventId: occurrence.id,
+          },
+        });
+      } catch (error) {
+        console.error('[googleCalendar] gagal memeriksa event yang hilang:', error);
+      }
     }
   } catch (err) {
     console.error('[googleCalendar] autoSyncTwoWay fetch error:', err);
+    throw err;
   }
 
   await prisma.user.update({
@@ -914,21 +1063,22 @@ export async function updateEvent(req: Request, res: Response) {
 // ============ Delete Google Calendar Event ============
 export async function deleteEvent(req: Request, res: Response) {
   if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
+  const userId = req.userId;
   const eventId = req.params.eventId;
 
-  const success = await deleteEventFromGoogleCalendar(req.userId, eventId);
-  if (!success) {
-    return sendError(res, 502, 'Gagal menghapus event dari Google Calendar.');
-  }
+  return withUserCalendarLock(userId, async () => {
+    const success = await deleteEventFromGoogleCalendar(userId, eventId);
+    if (!success) {
+      return sendError(res, 502, 'Gagal menghapus event dari Google Calendar.');
+    }
 
-  // Hapus DailyActivity lokal jika ada
-  await prisma.dailyActivity.deleteMany({
-    where: { userId: req.userId, googleEventId: eventId },
+    await prisma.dailyActivity.deleteMany({
+      where: { userId, googleEventId: eventId },
+    });
+    emitToUser(userId, 'calendar:synced', { action: 'delete', eventId });
+
+    return res.json({ success: true, data: { id: eventId } });
   });
-
-  emitToUser(req.userId, 'calendar:synced', { action: 'delete', eventId });
-
-  return res.json({ success: true, data: { id: eventId } });
 }
 
 // ============ Create Google Calendar Event ============

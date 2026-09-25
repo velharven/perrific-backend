@@ -8,6 +8,7 @@ import {
   deleteEventFromGoogleCalendar,
 } from './googleCalendarController';
 import { emitToUser } from '../lib/socket';
+import { withUserCalendarLock } from '../lib/calendarOperationLock';
 
 // ============ Helpers ============
 function parseLocalDate(s: string): Date | null {
@@ -274,29 +275,35 @@ export const udpateActivity = updateActivity;
 
 export async function deleteActivity(req: Request, res: Response) {
   if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
-  const existing = await prisma.dailyActivity.findFirst({
-    where: { id: req.params.activityId, userId: req.userId },
-  });
-  if (!existing) return sendError(res, 404, 'Aktivitas tidak ditemukan');
+  const userId = req.userId;
+  return withUserCalendarLock(userId, async () => {
+    const existing = await prisma.dailyActivity.findFirst({
+      where: { id: req.params.activityId, userId },
+    });
+    if (!existing) return sendError(res, 404, 'Aktivitas tidak ditemukan');
 
-  // Bersihkan event Google Calendar jika tertaut (tunggu agar tuntas di Google sebelum lanjut)
-  if (existing.googleEventId) {
-    try {
-      await deleteEventFromGoogleCalendar(req.userId, existing.googleEventId);
-    } catch (err) {
-      console.error('[activityController] Gagal auto-delete dari Google Calendar:', err);
+    // Aktivitas tertaut hanya boleh hilang lokal setelah Google mengonfirmasi
+    // penghapusan kejadian yang sama.
+    if (existing.googleEventId) {
+      const removedFromGoogle = await deleteEventFromGoogleCalendar(userId, existing.googleEventId, {
+        date: existing.date,
+        startTime: existing.startTime,
+      });
+      if (!removedFromGoogle) {
+        return sendError(res, 502, 'Gagal menghapus kegiatan dari Google Calendar. Coba lagi.');
+      }
     }
-  }
 
-  await prisma.dailyActivity.delete({ where: { id: req.params.activityId } });
-  emitToUser(req.userId, 'calendar:synced', {
-    action: 'delete',
-    activityId: req.params.activityId,
-    googleEventId: existing.googleEventId,
-  });
-  return res.json({
-    success: true,
-    data: { id: req.params.activityId, googleEventId: existing.googleEventId },
+    await prisma.dailyActivity.delete({ where: { id: req.params.activityId } });
+    emitToUser(userId, 'calendar:synced', {
+      action: 'delete',
+      activityId: req.params.activityId,
+      googleEventId: existing.googleEventId,
+    });
+    return res.json({
+      success: true,
+      data: { id: req.params.activityId, googleEventId: existing.googleEventId },
+    });
   });
 }
 
