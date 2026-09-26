@@ -85,8 +85,10 @@ model User {
   googleCalendarEmail       String?
   googleCalendarName        String?
   googleCalendarAvatarUrl   String?
-  googleCalendarAccessToken String?
-  googleCalendarSyncedAt    DateTime?
+  googleCalendarAccessToken    String?
+  googleCalendarRefreshToken   String?
+  googleCalendarTokenExpiresAt DateTime?
+  googleCalendarSyncedAt       DateTime?
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 

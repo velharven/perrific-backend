@@ -47,7 +47,7 @@ export async function listMyAssignedTasks(req: Request, res: Response) {
         select: { id: true, date: true, startTime: true, endTime: true },
       },
     },
-    orderBy: { createdAt: 'desc' },
+    orderBy: [{ column: { order: 'asc' } }, { order: 'asc' }, { createdAt: 'desc' }],
   });
 
   return res.json({

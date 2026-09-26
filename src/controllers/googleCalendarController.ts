@@ -106,14 +106,92 @@ async function findRecurringInstanceForActivity(
     .sort((a, b) => a.difference - b.difference)[0]?.item ?? null;
 }
 
+export async function refreshGoogleAccessToken(userId: string, refreshToken: string): Promise<string | null> {
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
+    console.error('[googleCalendar] GOOGLE_CLIENT_ID atau GOOGLE_CLIENT_SECRET tidak dikonfigurasi.');
+    return null;
+  }
+
+  try {
+    const res = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        refresh_token: refreshToken,
+        grant_type: 'refresh_token',
+      }),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error('[googleCalendar] refreshGoogleAccessToken gagal:', res.status, errText);
+      if (errText.includes('invalid_grant')) {
+        await prisma.user.update({
+          where: { id: userId },
+          data: {
+            googleCalendarConnected: false,
+            googleCalendarAccessToken: null,
+            googleCalendarRefreshToken: null,
+            googleCalendarTokenExpiresAt: null,
+          },
+        });
+      }
+      return null;
+    }
+
+    const data = (await res.json()) as { access_token: string; expires_in: number };
+    const expiresAt = new Date(Date.now() + (data.expires_in || 3600) * 1000);
+
+    await prisma.user.update({
+      where: { id: userId },
+      data: {
+        googleCalendarConnected: true,
+        googleCalendarAccessToken: data.access_token,
+        googleCalendarTokenExpiresAt: expiresAt,
+      },
+    });
+
+    return data.access_token;
+  } catch (error) {
+    console.error('[googleCalendar] Exception saat refreshGoogleAccessToken:', error);
+    return null;
+  }
+}
+
 async function getValidUserToken(userId: string): Promise<{ accessToken: string } | { error: string; code: number }> {
   const user = await prisma.user.findUnique({
     where: { id: userId },
-    select: { googleCalendarConnected: true, googleCalendarAccessToken: true },
+    select: {
+      googleCalendarConnected: true,
+      googleCalendarAccessToken: true,
+      googleCalendarRefreshToken: true,
+      googleCalendarTokenExpiresAt: true,
+    },
   });
 
-  if (!user || !user.googleCalendarConnected || !user.googleCalendarAccessToken) {
+  if (!user || !user.googleCalendarConnected) {
     return { error: 'Google Calendar belum terhubung.', code: 400 };
+  }
+
+  // Cek apakah token sudah kedaluwarsa atau akan kedaluwarsa dalam 5 menit ke depan (300.000 ms)
+  const isExpiredOrSoon =
+    !user.googleCalendarAccessToken ||
+    (user.googleCalendarTokenExpiresAt &&
+      user.googleCalendarTokenExpiresAt.getTime() - Date.now() < 300_000);
+
+  if (isExpiredOrSoon && user.googleCalendarRefreshToken) {
+    const refreshedToken = await refreshGoogleAccessToken(userId, user.googleCalendarRefreshToken);
+    if (refreshedToken) {
+      return { accessToken: refreshedToken };
+    }
+  }
+
+  if (!user.googleCalendarAccessToken) {
+    return { error: 'Sesi Google Calendar telah kedaluwarsa. Silakan hubungkan ulang.', code: 403 };
   }
 
   return { accessToken: user.googleCalendarAccessToken };
@@ -150,7 +228,8 @@ export async function getStatus(req: Request, res: Response) {
 
 // ============ Connect ============
 const connectSchema = z.object({
-  accessToken: z.string().min(1),
+  code: z.string().min(1).optional(),
+  accessToken: z.string().min(1).optional(),
   email: z.string().email().optional(),
 });
 
@@ -158,37 +237,103 @@ export async function connect(req: Request, res: Response) {
   if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
   const body = connectSchema.parse(req.body);
 
-  // Verifikasi access token ke Google tokeninfo
-  const tokenInfoRes = await fetch(
-    `https://oauth2.googleapis.com/tokeninfo?access_token=${encodeURIComponent(body.accessToken)}`,
-  );
+  let accessToken = body.accessToken;
+  let refreshToken: string | null = null;
+  let expiresAt: Date | null = null;
 
-  if (!tokenInfoRes.ok) {
-    return sendError(res, 400, 'Access token Google tidak valid atau sudah kedaluwarsa.');
+  if (body.code) {
+    const clientId = process.env.GOOGLE_CLIENT_ID;
+    const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+    if (!clientId || !clientSecret) {
+      return sendError(res, 500, 'GOOGLE_CLIENT_ID atau GOOGLE_CLIENT_SECRET belum dikonfigurasi di server.');
+    }
+
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code: body.code,
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uri: 'postmessage',
+        grant_type: 'authorization_code',
+      }),
+    });
+
+    if (!tokenRes.ok) {
+      const errText = await tokenRes.text();
+      console.error('[googleCalendar] Gagal menukar authorization code:', errText);
+      return sendError(res, 400, 'Gagal menukarkan kode otorisasi dengan Google.');
+    }
+
+    const tokenData = (await tokenRes.json()) as {
+      access_token: string;
+      expires_in?: number;
+      refresh_token?: string;
+    };
+
+    accessToken = tokenData.access_token;
+    refreshToken = tokenData.refresh_token || null;
+    if (tokenData.expires_in) {
+      expiresAt = new Date(Date.now() + tokenData.expires_in * 1000);
+    }
+  } else if (body.accessToken) {
+    // Verifikasi access token ke Google tokeninfo (fallback implicit flow)
+    const tokenInfoRes = await fetch(
+      `https://oauth2.googleapis.com/tokeninfo?access_token=${encodeURIComponent(body.accessToken)}`,
+    );
+
+    if (!tokenInfoRes.ok) {
+      return sendError(res, 400, 'Access token Google tidak valid atau sudah kedaluwarsa.');
+    }
+
+    const tokenInfo = (await tokenInfoRes.json()) as GoogleTokenInfo;
+    if (!body.email && tokenInfo.email) {
+      body.email = tokenInfo.email;
+    }
   }
 
-  const tokenInfo = (await tokenInfoRes.json()) as GoogleTokenInfo;
+  if (!accessToken) {
+    return sendError(res, 400, 'Access token atau authorization code diperlukan.');
+  }
 
-  let email = body.email || tokenInfo.email;
+  // Ambil profil lengkap dari Google userinfo
+  let email = body.email || null;
   let name: string | null = null;
   let picture: string | null = null;
 
-  // Ambil profil lengkap dari Google userinfo
-  const userRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-    headers: { Authorization: `Bearer ${body.accessToken}` },
-  });
-  if (userRes.ok) {
-    const userInfo = (await userRes.json()) as GoogleUserInfo;
-    email = userInfo.email || email;
-    name = userInfo.name || null;
-    picture = userInfo.picture || null;
+  try {
+    const userRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (userRes.ok) {
+      const userInfo = (await userRes.json()) as GoogleUserInfo;
+      email = userInfo.email || email;
+      name = userInfo.name || null;
+      picture = userInfo.picture || null;
+    }
+  } catch (err) {
+    console.error('[googleCalendar] Gagal mengambil profil Google userinfo:', err);
+  }
+
+  // Jika Google tidak mengembalikan refresh_token baru (karena sebelumnya sudah diizinkan),
+  // pertahankan refresh_token yang sudah ada di database jika ada
+  let finalRefreshToken = refreshToken;
+  if (!finalRefreshToken) {
+    const existing = await prisma.user.findUnique({
+      where: { id: req.userId },
+      select: { googleCalendarRefreshToken: true },
+    });
+    finalRefreshToken = existing?.googleCalendarRefreshToken || null;
   }
 
   await prisma.user.update({
     where: { id: req.userId },
     data: {
       googleCalendarConnected: true,
-      googleCalendarAccessToken: body.accessToken,
+      googleCalendarAccessToken: accessToken,
+      googleCalendarRefreshToken: finalRefreshToken,
+      googleCalendarTokenExpiresAt: expiresAt,
       googleCalendarEmail: email ?? null,
       googleCalendarName: name,
       googleCalendarAvatarUrl: picture,
@@ -217,6 +362,8 @@ export async function disconnect(req: Request, res: Response) {
     data: {
       googleCalendarConnected: false,
       googleCalendarAccessToken: null,
+      googleCalendarRefreshToken: null,
+      googleCalendarTokenExpiresAt: null,
       googleCalendarEmail: null,
       googleCalendarName: null,
       googleCalendarAvatarUrl: null,
@@ -265,11 +412,40 @@ export async function listEvents(req: Request, res: Response) {
     items = await listGoogleEventItems(tokenResult.accessToken, timeMin, timeMax, 250);
   } catch (error) {
     if (error instanceof GoogleCalendarListError && error.status === 401) {
+      // Coba refresh token dan retry sekali lagi
+      const user = await prisma.user.findUnique({
+        where: { id: req.userId },
+        select: { googleCalendarRefreshToken: true },
+      });
+      if (user?.googleCalendarRefreshToken) {
+        const refreshedToken = await refreshGoogleAccessToken(req.userId, user.googleCalendarRefreshToken);
+        if (refreshedToken) {
+          try {
+            items = await listGoogleEventItems(refreshedToken, timeMin, timeMax, 250);
+            const formatted = items
+              .filter((item) => item.status !== 'cancelled' && Boolean(item.start?.dateTime || item.start?.date))
+              .map((item) => ({
+                id: item.id,
+                title: item.summary || '(Tanpa judul)',
+                description: item.description || null,
+                location: item.location || null,
+                htmlLink: item.htmlLink || null,
+                start: item.start?.dateTime || item.start?.date,
+                end: item.end?.dateTime || item.end?.date,
+                allDay: !item.start?.dateTime,
+              }));
+            return res.json({ success: true, data: formatted });
+          } catch (retryError) {
+            console.error('[googleCalendar] retry listEvents gagal:', retryError);
+          }
+        }
+      }
+
       await prisma.user.update({
         where: { id: req.userId },
         data: { googleCalendarConnected: false, googleCalendarAccessToken: null },
       });
-      return sendError(res, 401, 'Sesi Google Calendar telah kedaluwarsa. Silakan hubungkan ulang.');
+      return sendError(res, 403, 'Sesi Google Calendar telah kedaluwarsa. Silakan hubungkan ulang.');
     }
     console.error('[googleCalendar] gagal mengambil event:', error);
     return sendError(res, 502, 'Gagal mengambil event dari Google Calendar.');
@@ -343,7 +519,7 @@ export async function pushActivityToGoogleCalendar(userId: string, activityId: s
   let description = activity.description || '';
   if (activity.checklistItems.length > 0) {
     description += '\n\nChecklist:\n' +
-      activity.checklistItems.map((c) => `${c.completed ? '☑' : '☐'} ${c.text}`).join('\n');
+      activity.checklistItems.map((c) => `${c.completed ? '[x]' : '[ ]'} ${c.text}`).join('\n');
   }
 
   const eventPayload = {
