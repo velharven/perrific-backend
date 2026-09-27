@@ -1,5 +1,6 @@
 import type { Request, Response } from 'express';
 import { z } from 'zod';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { sendError } from '../lib/errors';
 import { emitToUser } from '../lib/socket';
@@ -30,6 +31,7 @@ interface GoogleCalendarEventItem {
   originalStartTime?: { dateTime?: string; date?: string };
   start?: { dateTime?: string; date?: string };
   end?: { dateTime?: string; date?: string };
+  colorId?: string;
 }
 
 class GoogleCalendarListError extends Error {
@@ -433,6 +435,8 @@ export async function listEvents(req: Request, res: Response) {
                 start: item.start?.dateTime || item.start?.date,
                 end: item.end?.dateTime || item.end?.date,
                 allDay: !item.start?.dateTime,
+                colorId: item.colorId || null,
+                recurringEventId: item.recurringEventId || null,
               }));
             return res.json({ success: true, data: formatted });
           } catch (retryError) {
@@ -462,9 +466,73 @@ export async function listEvents(req: Request, res: Response) {
       start: item.start?.dateTime || item.start?.date,
       end: item.end?.dateTime || item.end?.date,
       allDay: !item.start?.dateTime,
+      colorId: item.colorId || null,
+      recurringEventId: item.recurringEventId || null,
     }));
 
   return res.json({ success: true, data: formatted });
+}
+
+interface RecurrenceRuleConfig {
+  freq: 'DAILY' | 'WEEKLY' | 'MONTHLY' | 'YEARLY';
+  interval?: number;
+  byDays?: number[];
+  byMonthDay?: number;
+  byWeekOfMonth?: {
+    week: number;
+    dayOfWeek: number;
+  };
+  endType?: 'NEVER' | 'ON_DATE' | 'AFTER';
+  untilDate?: string | null;
+  count?: number | null;
+}
+
+const RRULE_DAYS = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'] as const;
+
+function buildGoogleRecurrenceRule(raw: unknown): string[] | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const rec = raw as RecurrenceRuleConfig;
+  if (!rec.freq || !['DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY'].includes(rec.freq)) {
+    return null;
+  }
+
+  const parts: string[] = [`FREQ=${rec.freq}`];
+  const interval = Number(rec.interval) || 1;
+  if (interval > 1) {
+    parts.push(`INTERVAL=${interval}`);
+  }
+
+  if (rec.freq === 'WEEKLY' && Array.isArray(rec.byDays) && rec.byDays.length > 0) {
+    const dayCodes = rec.byDays
+      .filter((d) => Number.isInteger(d) && d >= 0 && d <= 6)
+      .map((d) => RRULE_DAYS[d]);
+    if (dayCodes.length > 0) {
+      parts.push(`BYDAY=${dayCodes.join(',')}`);
+    }
+  } else if (rec.freq === 'MONTHLY') {
+    if (
+      rec.byWeekOfMonth &&
+      typeof rec.byWeekOfMonth.week === 'number' &&
+      typeof rec.byWeekOfMonth.dayOfWeek === 'number' &&
+      rec.byWeekOfMonth.dayOfWeek >= 0 &&
+      rec.byWeekOfMonth.dayOfWeek <= 6
+    ) {
+      parts.push(`BYDAY=${rec.byWeekOfMonth.week}${RRULE_DAYS[rec.byWeekOfMonth.dayOfWeek]}`);
+    } else if (typeof rec.byMonthDay === 'number' && rec.byMonthDay >= 1 && rec.byMonthDay <= 31) {
+      parts.push(`BYMONTHDAY=${rec.byMonthDay}`);
+    }
+  }
+
+  if (rec.endType === 'AFTER' && typeof rec.count === 'number' && rec.count > 0) {
+    parts.push(`COUNT=${Math.floor(rec.count)}`);
+  } else if (rec.endType === 'ON_DATE' && typeof rec.untilDate === 'string' && rec.untilDate.trim()) {
+    const cleaned = rec.untilDate.trim().replace(/-/g, '').slice(0, 8);
+    if (/^\d{8}$/.test(cleaned)) {
+      parts.push(`UNTIL=${cleaned}T235959Z`);
+    }
+  }
+
+  return [`RRULE:${parts.join(';')}`];
 }
 
 // ============ Helper: Ekspor / Perbarui 1 Aktivitas ke Google Calendar ============
@@ -480,14 +548,16 @@ export async function pushActivityToGoogleCalendar(userId: string, activityId: s
 
   const hasValidStartTime = activity.startTime && !isNaN(activity.startTime.getTime());
   const hasValidEndTime = activity.endTime && !isNaN(activity.endTime.getTime());
+  const recurrenceRules = buildGoogleRecurrenceRule(activity.recurrence);
+  const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Jakarta';
 
   let startIso: string | undefined;
   let endIso: string | undefined;
   let startStr: string | undefined;
   let endStr: string | undefined;
 
-  let startPayload: { dateTime?: string | null; date?: string | null };
-  let endPayload: { dateTime?: string | null; date?: string | null };
+  let startPayload: { dateTime?: string | null; date?: string | null; timeZone?: string };
+  let endPayload: { dateTime?: string | null; date?: string | null; timeZone?: string };
 
   if (hasValidStartTime) {
     startIso = activity.startTime!.toISOString();
@@ -497,8 +567,8 @@ export async function pushActivityToGoogleCalendar(userId: string, activityId: s
       endIso = new Date(activity.startTime!.getTime() + 3600_000).toISOString();
     }
     // Set date: null agar PATCH Google API menghapus properti format all-day sebelumnya
-    startPayload = { dateTime: startIso, date: null };
-    endPayload = { dateTime: endIso, date: null };
+    startPayload = { dateTime: startIso, date: null, timeZone };
+    endPayload = { dateTime: endIso, date: null, timeZone };
   } else {
     // Untuk event sepanjang hari (all-day), Google Calendar API mewajibkan:
     // 1. Format tanggal YYYY-MM-DD
@@ -522,31 +592,43 @@ export async function pushActivityToGoogleCalendar(userId: string, activityId: s
       activity.checklistItems.map((c) => `${c.completed ? '[x]' : '[ ]'} ${c.text}`).join('\n');
   }
 
-  const eventPayload = {
+  const eventPayload: Record<string, unknown> = {
     summary: activity.title,
     description: description.trim() || undefined,
     status: 'confirmed',
     start: startPayload,
     end: endPayload,
+    ...(recurrenceRules
+      ? { recurrence: recurrenceRules }
+      : activity.googleEventId && activity.recurrence === null
+        ? { recurrence: [] }
+        : {}),
+    ...(activity.color !== undefined ? { colorId: activity.color || null } : {}),
   };
 
-  const cleanStartPayload = hasValidStartTime ? { dateTime: startIso } : { date: startStr };
-  const cleanEndPayload = hasValidStartTime ? { dateTime: endIso } : { date: endStr };
-  const postPayload = {
+  const cleanStartPayload = hasValidStartTime ? { dateTime: startIso, timeZone } : { date: startStr };
+  const cleanEndPayload = hasValidStartTime ? { dateTime: endIso, timeZone } : { date: endStr };
+  const postPayload: Record<string, unknown> = {
     summary: activity.title,
     description: description.trim() || undefined,
     status: 'confirmed',
     start: cleanStartPayload,
     end: cleanEndPayload,
+    ...(recurrenceRules ? { recurrence: recurrenceRules } : {}),
+    ...(activity.color ? { colorId: activity.color } : {}),
   };
 
-  const isUpdate = Boolean(activity.googleEventId);
+  const targetGoogleEventId =
+    recurrenceRules && activity.googleEventId?.includes('_')
+      ? activity.googleEventId.split('_')[0]
+      : activity.googleEventId;
+  const isUpdate = Boolean(targetGoogleEventId);
   let gRes: globalThis.Response;
 
   try {
     if (isUpdate) {
       gRes = await fetch(
-        `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(activity.googleEventId!)}`,
+        `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(targetGoogleEventId!)}`,
         {
           method: 'PATCH',
           headers: {
@@ -766,13 +848,36 @@ async function autoSyncTwoWayUnlocked(
           where: { userId, googleEventId: item.id },
         });
 
+        const baseId = item.recurringEventId || (item.id.includes('_') ? item.id.split('_')[0] : null);
+        if (baseId) {
+          activeEventIds.add(baseId);
+          // Jika aktivitas lokal merupakan master kegiatan berulang (memiliki aturan recurrence),
+          // jangan buat baris duplikat baru untuk setiap instansi tanggalnya.
+          const recurringMaster = await prisma.dailyActivity.findFirst({
+            where: {
+              userId,
+              OR: [{ googleEventId: baseId }, { googleEventId: item.id }],
+              NOT: { recurrence: { equals: Prisma.DbNull } },
+            },
+          });
+          if (recurringMaster) {
+            if (recurringMaster.googleEventId !== baseId) {
+              await prisma.dailyActivity.update({
+                where: { id: recurringMaster.id },
+                data: { googleEventId: baseId },
+              });
+            }
+            continue;
+          }
+        }
+
         // Cek juga base ID jika item.id memiliki suffix recurrence (_...) tapi HANYA pada tanggal yang sama
         if (!existing && item.id.includes('_')) {
-          const baseId = item.id.split('_')[0];
+          const splitBaseId = item.id.split('_')[0];
           existing = await prisma.dailyActivity.findFirst({
             where: {
               userId,
-              googleEventId: baseId,
+              googleEventId: splitBaseId,
               date: dateOnly,
             },
           });
@@ -842,6 +947,7 @@ async function autoSyncTwoWayUnlocked(
               startTime: finalStartTime,
               endTime: finalEndTime,
               googleEventId: item.id,
+              color: item.colorId || null,
             },
           });
         } else {
@@ -857,6 +963,7 @@ async function autoSyncTwoWayUnlocked(
               type: 'CUSTOM',
               status: 'PENDING',
               googleEventId: item.id,
+              color: item.colorId || null,
             },
           });
           importedCount++;
@@ -874,6 +981,7 @@ async function autoSyncTwoWayUnlocked(
       },
     });
     for (const activity of linkedActivities) {
+      if (activity.recurrence) continue; // Lindungi master kegiatan berulang agar tidak tertimpa/dihapus oleh pengecekan instansi tunggal
       const eventId = activity.googleEventId;
       if (!eventId || activeEventIds.has(eventId)) continue;
       try {
@@ -1099,6 +1207,8 @@ const updateEventSchema = z.object({
   date: z.string().optional(),
   startTime: z.string().nullable().optional(),
   endTime: z.string().nullable().optional(),
+  recurrence: z.record(z.unknown()).nullable().optional(),
+  colorId: z.string().nullable().optional(),
 });
 
 export async function updateEvent(req: Request, res: Response) {
@@ -1113,9 +1223,11 @@ export async function updateEvent(req: Request, res: Response) {
 
   const hasStartTime = Boolean(body.startTime && !isNaN(new Date(body.startTime).getTime()));
   const hasEndTime = Boolean(body.endTime && !isNaN(new Date(body.endTime).getTime()));
+  const recurrenceRules = body.recurrence !== undefined ? buildGoogleRecurrenceRule(body.recurrence) : undefined;
+  const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Jakarta';
 
-  let startPayload: { dateTime?: string | null; date?: string | null } = {};
-  let endPayload: { dateTime?: string | null; date?: string | null } = {};
+  let startPayload: { dateTime?: string | null; date?: string | null; timeZone?: string } = {};
+  let endPayload: { dateTime?: string | null; date?: string | null; timeZone?: string } = {};
 
   let startIso: string | undefined;
   let endIso: string | undefined;
@@ -1129,8 +1241,8 @@ export async function updateEvent(req: Request, res: Response) {
     } else {
       endIso = new Date(new Date(body.startTime!).getTime() + 3600_000).toISOString();
     }
-    startPayload = { dateTime: startIso, date: null };
-    endPayload = { dateTime: endIso, date: null };
+    startPayload = { dateTime: startIso, date: null, timeZone };
+    endPayload = { dateTime: endIso, date: null, timeZone };
   } else if (body.date) {
     const baseDate = new Date(body.date);
     const validDate = isNaN(baseDate.getTime()) ? new Date() : baseDate;
@@ -1149,10 +1261,19 @@ export async function updateEvent(req: Request, res: Response) {
   if (body.description !== undefined) eventPayload.description = body.description;
   if (startPayload.dateTime !== undefined || startPayload.date !== undefined) eventPayload.start = startPayload;
   if (endPayload.dateTime !== undefined || endPayload.date !== undefined) eventPayload.end = endPayload;
+  if (body.recurrence !== undefined) {
+    eventPayload.recurrence = recurrenceRules ?? [];
+  }
+  if (body.colorId !== undefined) {
+    eventPayload.colorId = body.colorId || null;
+  }
+
+  const targetEventId =
+    recurrenceRules && eventId.includes('_') ? eventId.split('_')[0] : eventId;
 
   try {
     let gRes = await fetch(
-      `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(eventId)}`,
+      `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(targetEventId)}`,
       {
         method: 'PATCH',
         headers: {
@@ -1164,13 +1285,15 @@ export async function updateEvent(req: Request, res: Response) {
     );
 
     if (gRes.status === 400 || gRes.status === 404 || gRes.status === 410) {
-      const cleanStart = hasStartTime ? { dateTime: startIso } : { date: startStr };
-      const cleanEnd = hasStartTime ? { dateTime: endIso } : { date: endStr };
+      const cleanStart = hasStartTime ? { dateTime: startIso, timeZone } : { date: startStr };
+      const cleanEnd = hasStartTime ? { dateTime: endIso, timeZone } : { date: endStr };
       const postPayload: Record<string, unknown> = {
         summary: body.title || 'Tanpa judul',
         description: body.description || undefined,
         start: cleanStart,
         end: cleanEnd,
+        ...(recurrenceRules ? { recurrence: recurrenceRules } : {}),
+        ...(body.colorId ? { colorId: body.colorId } : {}),
       };
       gRes = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
         method: 'POST',
@@ -1188,9 +1311,15 @@ export async function updateEvent(req: Request, res: Response) {
       return sendError(res, 502, 'Gagal memperbarui event di Google Calendar.');
     }
 
+    const updatedGoogleData = (await gRes.json()) as { id?: string };
+    const finalEventId = updatedGoogleData.id || targetEventId;
+
     // Periksa apakah ada DailyActivity lokal yang tertaut
     const existing = await prisma.dailyActivity.findFirst({
-      where: { userId: req.userId, googleEventId: eventId },
+      where: {
+        userId: req.userId,
+        OR: [{ googleEventId: eventId }, { googleEventId: targetEventId }, { googleEventId: finalEventId }],
+      },
     });
 
     const actDate = body.date
@@ -1199,6 +1328,13 @@ export async function updateEvent(req: Request, res: Response) {
         ? new Date(body.startTime!)
         : new Date();
     actDate.setHours(0, 0, 0, 0);
+
+    const recurrenceDbVal =
+      body.recurrence === undefined
+        ? undefined
+        : body.recurrence === null
+          ? Prisma.DbNull
+          : (body.recurrence as unknown as Prisma.InputJsonValue);
 
     if (existing) {
       await prisma.dailyActivity.update({
@@ -1209,6 +1345,9 @@ export async function updateEvent(req: Request, res: Response) {
           date: actDate,
           startTime: hasStartTime ? new Date(body.startTime!) : null,
           endTime: hasEndTime ? new Date(body.endTime!) : null,
+          googleEventId: finalEventId,
+          ...(recurrenceDbVal !== undefined ? { recurrence: recurrenceDbVal } : {}),
+          ...(body.colorId !== undefined ? { color: body.colorId || null } : {}),
         },
       });
     } else {
@@ -1222,14 +1361,16 @@ export async function updateEvent(req: Request, res: Response) {
           endTime: hasEndTime ? new Date(body.endTime!) : null,
           type: 'CUSTOM',
           status: 'PENDING',
-          googleEventId: eventId,
+          googleEventId: finalEventId,
+          ...(recurrenceDbVal !== undefined ? { recurrence: recurrenceDbVal } : {}),
+          color: body.colorId || null,
         },
       });
     }
 
-    emitToUser(req.userId, 'calendar:synced', { action: 'update', eventId });
+    emitToUser(req.userId, 'calendar:synced', { action: 'update', eventId: finalEventId });
 
-    return res.json({ success: true, data: { id: eventId } });
+    return res.json({ success: true, data: { id: finalEventId } });
   } catch (err) {
     console.error('[googleCalendar] updateEvent exception:', err);
     return sendError(res, 500, 'Terjadi kesalahan saat memperbarui event Google.');

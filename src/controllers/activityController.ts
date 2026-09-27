@@ -83,12 +83,22 @@ export async function listMyActivities(req: Request, res: Response) {
       : 100;
 
   const where: Record<string, unknown> = { userId: req.userId };
+  const andConditions: Record<string, unknown>[] = [];
 
   if (gte || lt) {
-    (where as Record<string, unknown>).date = {
-      ...(gte ? { gte } : {}),
-      ...(lt ? { lt } : {}),
-    };
+    andConditions.push({
+      OR: [
+        {
+          date: {
+            ...(gte ? { gte } : {}),
+            ...(lt ? { lt } : {}),
+          },
+        },
+        {
+          NOT: { recurrence: { equals: Prisma.DbNull } },
+        },
+      ],
+    });
   }
   if (status && ['PENDING', 'COMPLETED', 'SKIPPED'].includes(status)) {
     (where as Record<string, unknown>).status = status;
@@ -97,10 +107,15 @@ export async function listMyActivities(req: Request, res: Response) {
     (where as Record<string, unknown>).type = type;
   }
   if (search && typeof search === 'string' && search.trim()) {
-    (where as Record<string, unknown>).OR = [
-      { title: { contains: search, mode: 'insensitive' } },
-      { description: { contains: search, mode: 'insensitive' } },
-    ];
+    andConditions.push({
+      OR: [
+        { title: { contains: search, mode: 'insensitive' } },
+        { description: { contains: search, mode: 'insensitive' } },
+      ],
+    });
+  }
+  if (andConditions.length > 0) {
+    where.AND = andConditions;
   }
 
   const activities = await prisma.dailyActivity.findMany({
@@ -116,6 +131,25 @@ export async function listMyActivities(req: Request, res: Response) {
   return res.json({ success: true, data: activities });
 }
 
+const recurrenceSchema = z
+  .object({
+    freq: z.enum(['DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY']),
+    interval: z.number().int().min(1).default(1),
+    byDays: z.array(z.number().int().min(0).max(6)).optional(),
+    byMonthDay: z.number().int().min(1).max(31).optional(),
+    byWeekOfMonth: z
+      .object({
+        week: z.number().int(),
+        dayOfWeek: z.number().int().min(0).max(6),
+      })
+      .optional(),
+    endType: z.enum(['NEVER', 'ON_DATE', 'AFTER']).default('NEVER'),
+    untilDate: z.string().nullable().optional(),
+    count: z.number().int().min(1).nullable().optional(),
+  })
+  .nullable()
+  .optional();
+
 // ============ Create (supports inline checklist & icon/ordering) ============
 const createActivitySchema = z.object({
   title: z.string().min(1),
@@ -130,6 +164,8 @@ const createActivitySchema = z.object({
   order: z.number().optional(),
   createdAt: z.string().datetime().optional().or(z.string().optional()),
   customValues: z.record(z.union([z.string(), z.number(), z.boolean()])).nullable().optional(),
+  recurrence: recurrenceSchema,
+  color: z.string().nullable().optional(),
   checklist: z
     .array(z.object({ text: z.string().min(1) }))
     .optional(),
@@ -168,6 +204,11 @@ export async function createActivity(req: Request, res: Response) {
       order: body.order ?? 0,
       createdAt: createdAtDate ?? undefined,
       customValues: (body.customValues ?? undefined) as unknown as Prisma.InputJsonValue | undefined,
+      color: body.color ?? null,
+      recurrence:
+        body.recurrence === null
+          ? Prisma.DbNull
+          : ((body.recurrence ?? undefined) as unknown as Prisma.InputJsonValue | undefined),
       checklistItems: body.checklist
         ? {
             create: body.checklist.map((c, idx) => ({
@@ -213,6 +254,8 @@ const updateActivitySchema = z.object({
   icon: z.string().max(8).nullable().optional(),
   order: z.number().optional(),
   type: z.enum(['TASK', 'BREAKDOWN', 'CUSTOM']).optional(),
+  recurrence: recurrenceSchema,
+  color: z.string().nullable().optional(),
 });
 
 export async function updateActivity(req: Request, res: Response) {
@@ -231,6 +274,13 @@ export async function updateActivity(req: Request, res: Response) {
   if (body.icon !== undefined) data.icon = body.icon;
   if (body.order !== undefined) data.order = body.order;
   if (body.type !== undefined) data.type = body.type;
+  if (body.color !== undefined) data.color = body.color;
+  if (body.recurrence !== undefined) {
+    data.recurrence =
+      body.recurrence === null
+        ? Prisma.DbNull
+        : (body.recurrence as unknown as Prisma.InputJsonValue);
+  }
   if (body.date !== undefined) {
     const d = parseOptionalDate(body.date);
     if (d) data.date = d;
@@ -427,6 +477,7 @@ export async function duplicateActivity(req: Request, res: Response) {
       order: source.order + 0.5,
       taskId: source.taskId,
       customValues: source.customValues ?? undefined,
+      recurrence: (source.recurrence ?? undefined) as unknown as Prisma.InputJsonValue | undefined,
       checklistItems: {
         create: source.checklistItems.map((c) => ({
           text: c.text,

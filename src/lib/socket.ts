@@ -2,6 +2,7 @@ import type { Server as HttpServer } from 'http';
 import { Server as SocketServer } from 'socket.io';
 import { env } from '../config/env';
 import { verifyToken } from './jwt';
+import { prisma } from './prisma';
 
 export const roomNames = {
   team: (teamId: string) => `team:${teamId}`,
@@ -59,3 +60,24 @@ export function emitToTeam(teamId: string, event: string, data: unknown) {
     console.warn(`[socket] emitToTeam failed for team ${teamId}:`, err);
   }
 }
+
+export async function emitToTeamMembers(
+  teamId: string,
+  event: string,
+  data: unknown,
+  extraUserIds: string[] = [],
+) {
+  try {
+    const members = await prisma.teamMember.findMany({
+      where: { teamId },
+      select: { userId: true },
+    });
+    const targetIds = new Set([...members.map((m) => m.userId), ...extraUserIds]);
+    for (const uid of targetIds) {
+      emitToUser(uid, event, data);
+    }
+  } catch (err) {
+    console.warn(`[socket] emitToTeamMembers failed for team ${teamId}:`, err);
+  }
+}
+

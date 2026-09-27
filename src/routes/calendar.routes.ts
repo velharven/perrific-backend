@@ -1,10 +1,14 @@
 import { Router } from 'express';
 import * as googleCalendarController from '../controllers/googleCalendarController';
+import * as calendarLayoutController from '../controllers/calendarLayoutController';
 import { authRequired } from '../middleware/auth';
 
 const router = Router();
 
 router.use(authRequired);
+
+router.get('/layout', calendarLayoutController.listLayout);
+router.put('/layout/:date', calendarLayoutController.saveLayout);
 
 // Google Calendar integration routes
 router.get('/google/status', googleCalendarController.getStatus);

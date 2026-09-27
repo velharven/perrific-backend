@@ -3,27 +3,171 @@ import { z } from 'zod';
 import { prisma } from '../lib/prisma';
 import { sendError } from '../lib/errors';
 
-// Kamar bawaan tiap user: 1 dashboard + 1 daily berkunci acak.
-// Dipanggil dari list agar user lama otomatis dapat tanpa migrasi data.
-async function ensurePrivatDefaults(userId: string) {
-  const kinds = await prisma.note.findMany({
-    where: { userId, kind: { in: ['DASHBOARD', 'DAILY'] } },
-    select: { kind: true },
-  });
-  const has = new Set(kinds.map((k) => k.kind));
-  if (has.has('DASHBOARD') && has.has('DAILY')) return;
+function newBlockId(): string {
+  return Math.random().toString(36).slice(2, 10);
+}
 
-  const maxOrder = await prisma.note.aggregate({
+function buildWelcomeNoteContent(userName?: string | null): string {
+  const firstName = userName?.trim().split(/\s+/)[0] || 'Teman';
+  const blocks = [
+    {
+      id: newBlockId(),
+      type: 'h2',
+      text: `👋 Halo, ${firstName}! Selamat datang di Purrific.`,
+      children: [],
+    },
+    {
+      id: newBlockId(),
+      type: 'text',
+      text: 'Ini adalah halaman catatan pribadimu. Kamu bebas menulis ide, merancang rencana, membuat daftar tugas, atau menyusun subhalaman di sini layaknya di Notion.',
+      children: [],
+    },
+    {
+      id: newBlockId(),
+      type: 'divider',
+      text: '',
+      children: [],
+    },
+    {
+      id: newBlockId(),
+      type: 'h3',
+      text: 'Mulai dari sini',
+      children: [],
+    },
+    {
+      id: newBlockId(),
+      type: 'todo',
+      text: 'Masuk ke ruang kerja Purrific',
+      checked: true,
+      children: [],
+    },
+    {
+      id: newBlockId(),
+      type: 'todo',
+      text: 'Klik di mana saja pada halaman ini dan mulai mengetik',
+      checked: false,
+      children: [],
+    },
+    {
+      id: newBlockId(),
+      type: 'todo',
+      text: "Ketik '/' di baris kosong untuk memilih jenis blok (Judul, To-do, Toggle, Tabel, Subhalaman)",
+      checked: false,
+      children: [],
+    },
+    {
+      id: newBlockId(),
+      type: 'todo',
+      text: 'Seret ikon titik-enam (⋮⋮) di sebelah kiri blok untuk mengatur ulang urutan',
+      checked: false,
+      children: [],
+    },
+    {
+      id: newBlockId(),
+      type: 'todo',
+      text: 'Buka tab Aktivitas Harian di sidebar untuk mengelola jadwal & tugas tim',
+      checked: false,
+      children: [],
+    },
+    {
+      id: newBlockId(),
+      type: 'toggle',
+      text: '💡 Tips singkat pintasan ketik (Markdown)',
+      collapsed: false,
+      children: [
+        {
+          id: newBlockId(),
+          type: 'bullet',
+          text: "Ketik '# ', '## ', atau '### ' di awal baris untuk membuat Judul 1, 2, atau 3",
+          children: [],
+        },
+        {
+          id: newBlockId(),
+          type: 'bullet',
+          text: "Ketik '- ' untuk daftar poin atau '1. ' untuk daftar bernomor",
+          children: [],
+        },
+        {
+          id: newBlockId(),
+          type: 'bullet',
+          text: "Ketik '--- ' untuk menyisipkan garis pembatas",
+          children: [],
+        },
+        {
+          id: newBlockId(),
+          type: 'bullet',
+          text: 'Tekan Tab untuk menjorokkan blok ke dalam, atau Shift + Tab untuk mengeluarkan',
+          children: [],
+        },
+      ],
+    },
+  ];
+  return JSON.stringify({ version: 2, blocks });
+}
+
+// Kamar bawaan tiap user: 1 catatan "Selamat Datang" + 1 daily berkunci acak.
+// Dipanggil dari list agar user baru maupun lama otomatis mendapatkannya
+// (serta mengonversi tab DASHBOARD warisan menjadi catatan "Selamat Datang").
+async function ensurePrivatDefaults(userId: string) {
+  const existingNotes = await prisma.note.findMany({
     where: { userId },
-    _max: { order: true },
+    orderBy: [{ order: 'asc' }, { createdAt: 'asc' }],
+    select: { id: true, kind: true, title: true, content: true, order: true },
   });
-  let order = (maxOrder._max.order ?? -1) + 1;
-  const toCreate: { kind: 'DASHBOARD' | 'DAILY'; title: string }[] = [];
-  if (!has.has('DASHBOARD')) toCreate.push({ kind: 'DASHBOARD', title: 'Dashboard' });
-  if (!has.has('DAILY')) toCreate.push({ kind: 'DAILY', title: 'Aktivitas Harian' });
-  for (const item of toCreate) {
+
+  const dashboardNotes = existingNotes.filter((n) => n.kind === 'DASHBOARD');
+  let hasNote = existingNotes.some((n) => n.kind === 'NOTE');
+  const hasDaily = existingNotes.some((n) => n.kind === 'DAILY');
+
+  if (dashboardNotes.length === 0 && hasNote && hasDaily) return;
+
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { name: true },
+  });
+  const welcomeContent = buildWelcomeNoteContent(user?.name);
+
+  if (dashboardNotes.length > 0) {
+    const [firstDash, ...restDash] = dashboardNotes;
+    await prisma.note.update({
+      where: { id: firstDash.id },
+      data: {
+        kind: 'NOTE',
+        title: 'Selamat Datang',
+        content: welcomeContent,
+      },
+    });
+    hasNote = true;
+    if (restDash.length > 0) {
+      await prisma.note.deleteMany({
+        where: { id: { in: restDash.map((d) => d.id) }, userId },
+      });
+    }
+  }
+
+  let order = existingNotes.reduce((max, n) => Math.max(max, n.order), -1) + 1;
+
+  if (!hasNote) {
     await prisma.note.create({
-      data: { userId, kind: item.kind, title: item.title, content: '', order: order++ },
+      data: {
+        userId,
+        kind: 'NOTE',
+        title: 'Selamat Datang',
+        content: welcomeContent,
+        order: 0,
+      },
+    });
+  }
+
+  if (!hasDaily) {
+    await prisma.note.create({
+      data: {
+        userId,
+        kind: 'DAILY',
+        title: 'Aktivitas Harian',
+        content: '',
+        order: order++,
+      },
     });
   }
 }
@@ -39,10 +183,10 @@ export async function listMyNotes(req: Request, res: Response) {
   return res.json({ success: true, data: notes });
 }
 
-// ============ Create (halaman catatan kosong / dashboard / daily) ============
+// ============ Create (halaman catatan kosong / daily / table) ============
 const createNoteSchema = z.object({
   title: z.string().max(120).optional(),
-  kind: z.enum(['NOTE', 'DASHBOARD', 'DAILY', 'TABLE']).optional(),
+  kind: z.enum(['NOTE', 'DAILY', 'TABLE']).optional(),
   parentId: z.string().uuid().nullable().optional(),
 });
 
@@ -62,17 +206,24 @@ export async function createNote(req: Request, res: Response) {
   });
 
   const kind = body.kind ?? 'NOTE';
-  const defaultTitle = kind === 'DASHBOARD' ? 'Dashboard' : kind === 'DAILY' ? 'Aktivitas Harian' : kind === 'TABLE' ? 'Tabel tanpa judul' : 'Tanpa judul';
+  const defaultTitle = kind === 'DAILY' ? 'Aktivitas Harian' : kind === 'TABLE' ? 'Tabel tanpa judul' : 'Tanpa judul';
+  const finalTitle = body.title?.trim() ? body.title.trim() : defaultTitle;
+  let initialContent = '';
+  if (kind === 'NOTE' && finalTitle === 'Selamat Datang') {
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { name: true } });
+    initialContent = buildWelcomeNoteContent(user?.name);
+  }
+
   const note = await prisma.$transaction(async (tx) => {
     const created = await tx.note.create({
-    data: {
-      userId,
-      kind,
-      parentId,
-      title: body.title?.trim() ? body.title.trim() : defaultTitle,
-      content: '',
-      order: (maxOrder._max.order ?? -1) + 1,
-    },
+      data: {
+        userId,
+        kind,
+        parentId,
+        title: finalTitle,
+        content: initialContent,
+        order: (maxOrder._max.order ?? -1) + 1,
+      },
     });
     if (kind === 'TABLE') {
       // Tabel baru mulai dari 1 kolom Nama; properti lain via tombol +.

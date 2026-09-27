@@ -29,16 +29,18 @@ export function createApp() {
   // Default 100KB melempar 413 untuk foto sampul realistis (begitu juga
   // avatar 300KB yang sudah lebih dulu mengizinkannya di validasi).
   app.use(express.json({ limit: '1mb' }));
-  // Limiter global longgar untuk baca/tulis biasa; auth tetap ketat di
+  // Limiter global longgar untuk baca/tulis biasa di production; auth tetap ketat di
   // bawah (anti brute-force login) karena limiter ini mencakup semua /api.
-  app.use(
-    rateLimit({
-      windowMs: 15 * 60 * 1000,
-      max: 2000,
-      standardHeaders: true,
-      legacyHeaders: false,
-    }),
-  );
+  if (env.nodeEnv !== 'development') {
+    app.use(
+      rateLimit({
+        windowMs: 15 * 60 * 1000,
+        max: 2000,
+        standardHeaders: true,
+        legacyHeaders: false,
+      }),
+    );
+  }
 
   app.use('/api/auth', authLimiter);
   app.use('/api', routes);

@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { prisma } from '../lib/prisma';
 import { sendError } from '../lib/errors';
 import { assigneesInclude, columnSelect, createdBySelect, uniqIds, watchersInclude, withAssignees, withWatchers } from '../lib/taskAssignees';
-import { emitToUser } from '../lib/socket';
+import { emitToTeamMembers, emitToUser } from '../lib/socket';
 import { can } from '../lib/permissions';
 
 export async function getTask(req: Request, res: Response) {
@@ -27,7 +27,11 @@ export async function listMyAssignedTasks(req: Request, res: Response) {
 
   const tasks = await prisma.task.findMany({
     where: {
-      assignees: { some: { userId: req.userId } },
+      project: {
+        team: {
+          members: { some: { userId: req.userId } },
+        },
+      },
       approval: 'APPROVED',
     },
     include: {
@@ -165,6 +169,12 @@ export async function updateTask(req: Request, res: Response) {
       data: logs.map((l) => ({ taskId: task.id, actorId, ...l })),
     });
   }
+  await emitToTeamMembers(checked.membership.teamId, 'task:updated', {
+    taskId: task.id,
+    projectId: task.projectId,
+    teamId: checked.membership.teamId,
+    action: 'UPDATED',
+  });
   return res.json({ success: true, data: withWatchers(withAssignees(task)) });
 }
 
@@ -185,12 +195,18 @@ export async function deleteTask(req: Request, res: Response) {
   }
   const taskBefore = await prisma.task.findUnique({
     where: { id: req.params.taskId },
-    select: { assignees: { select: { userId: true } } },
+    select: { projectId: true, assignees: { select: { userId: true } } },
   });
   await prisma.task.delete({ where: { id: req.params.taskId } });
   for (const a of taskBefore?.assignees ?? []) {
     emitToUser(a.userId, 'task:assigned', { taskId: req.params.taskId, action: 'UNASSIGNED' });
   }
+  await emitToTeamMembers(checked.membership.teamId, 'task:updated', {
+    taskId: req.params.taskId,
+    projectId: taskBefore?.projectId,
+    teamId: checked.membership.teamId,
+    action: 'DELETED',
+  });
   return res.json({ success: true, data: { id: req.params.taskId } });
 }
 
@@ -452,6 +468,12 @@ async function decideApproval(req: Request, res: Response, approval: 'APPROVED' 
       action: approval === 'APPROVED' ? 'ASSIGNED' : 'UNASSIGNED',
     });
   }
+  await emitToTeamMembers(checked.membership.teamId, 'task:updated', {
+    taskId: task.id,
+    projectId: task.projectId,
+    teamId: checked.membership.teamId,
+    action: approval,
+  });
 
   return res.json({ success: true, data: withWatchers(withAssignees(task)) });
 }

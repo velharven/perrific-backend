@@ -4,7 +4,7 @@ import { prisma } from '../lib/prisma';
 import { sendError } from '../lib/errors';
 import { AVATAR_RE, avatarUrlField } from '../lib/avatar';
 import { assigneesInclude, columnSelect, createdBySelect, uniqIds, watchersInclude, withAssignees, withWatchers } from '../lib/taskAssignees';
-import { emitToUser } from '../lib/socket';
+import { emitToTeamMembers, emitToUser } from '../lib/socket';
 import { can, ensureProjectMember, PERMISSIONS } from '../lib/permissions';
 import type { PermissionKey } from '../lib/permissions';
 
@@ -59,6 +59,11 @@ export async function updateProject(req: Request, res: Response) {
     where: { id: req.params.projectId },
     data: { ...body },
   });
+  await emitToTeamMembers(checked.project.teamId, 'project:updated', {
+    teamId: checked.project.teamId,
+    projectId: project.id,
+    action: 'UPDATED',
+  });
   return res.json({ success: true, data: project });
 }
 
@@ -75,6 +80,11 @@ export async function deleteProject(req: Request, res: Response) {
     return sendError(res, 403, 'Hanya admin tim yang bisa menghapus');
   }
   await prisma.project.delete({ where: { id: req.params.projectId } });
+  await emitToTeamMembers(checked.project.teamId, 'project:updated', {
+    teamId: checked.project.teamId,
+    projectId: req.params.projectId,
+    action: 'DELETED',
+  });
   return res.json({ success: true, data: { id: req.params.projectId } });
 }
 
@@ -148,6 +158,11 @@ export async function reorderTasks(req: Request, res: Response) {
   await prisma.$transaction(
     body.orderedIds.map((id, idx) => prisma.task.update({ where: { id }, data: { order: idx } })),
   );
+  await emitToTeamMembers(checked.project.teamId, 'task:updated', {
+    teamId: checked.project.teamId,
+    projectId: req.params.projectId,
+    action: 'REORDERED',
+  });
   return res.json({ success: true, data: { orderedIds: body.orderedIds } });
 }
 
@@ -235,6 +250,12 @@ export async function createTask(req: Request, res: Response) {
       emitToUser(userId, 'task:assigned', { taskId: task.id, action: 'ASSIGNED' });
     }
   }
+  await emitToTeamMembers(checked.project.teamId, 'task:updated', {
+    teamId: checked.project.teamId,
+    projectId: req.params.projectId,
+    taskId: task.id,
+    action: 'CREATED',
+  });
   // Usulan anggota: beri tahu semua yang bisa approve di project ini.
   if (approval === 'PENDING' && req.userId) {
     const proposer = await prisma.user.findUnique({
@@ -318,6 +339,11 @@ export async function createColumn(req: Request, res: Response) {
   const column = await prisma.boardColumn.create({
     data: { projectId: req.params.projectId, name: body.name, order: (last?.order ?? -1) + 1 },
   });
+  await emitToTeamMembers(checked.project.teamId, 'project:updated', {
+    teamId: checked.project.teamId,
+    projectId: req.params.projectId,
+    action: 'COLUMN_UPDATED',
+  });
   return res.status(201).json({ success: true, data: column });
 }
 
@@ -342,6 +368,11 @@ export async function updateColumn(req: Request, res: Response) {
   if (!column || column.projectId !== req.params.projectId) {
     return sendError(res, 404, 'Kolom tidak ditemukan');
   }
+  await emitToTeamMembers(checked.project.teamId, 'project:updated', {
+    teamId: checked.project.teamId,
+    projectId: req.params.projectId,
+    action: 'COLUMN_UPDATED',
+  });
   return res.json({ success: true, data: column });
 }
 
@@ -358,6 +389,11 @@ export async function reorderColumns(req: Request, res: Response) {
   await prisma.$transaction(
     body.orderedIds.map((id, idx) => prisma.boardColumn.update({ where: { id }, data: { order: idx } })),
   );
+  await emitToTeamMembers(checked.project.teamId, 'project:updated', {
+    teamId: checked.project.teamId,
+    projectId: req.params.projectId,
+    action: 'COLUMN_UPDATED',
+  });
   return res.json({ success: true, data: { orderedIds: body.orderedIds } });
 }
 
@@ -400,9 +436,24 @@ export async function deleteColumn(req: Request, res: Response) {
       ),
       prisma.boardColumn.delete({ where: { id: column.id } }),
     ]);
+    await emitToTeamMembers(checked.project.teamId, 'project:updated', {
+      teamId: checked.project.teamId,
+      projectId: req.params.projectId,
+      action: 'COLUMN_UPDATED',
+    });
+    await emitToTeamMembers(checked.project.teamId, 'task:updated', {
+      teamId: checked.project.teamId,
+      projectId: req.params.projectId,
+      action: 'UPDATED',
+    });
     return res.json({ success: true, data: { id: column.id, movedCount: moving.length } });
   }
   await prisma.boardColumn.delete({ where: { id: column.id } });
+  await emitToTeamMembers(checked.project.teamId, 'project:updated', {
+    teamId: checked.project.teamId,
+    projectId: req.params.projectId,
+    action: 'COLUMN_UPDATED',
+  });
   return res.json({ success: true, data: { id: column.id, movedCount: 0 } });
 }
 

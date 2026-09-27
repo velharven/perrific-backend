@@ -6,8 +6,14 @@ import { AVATAR_RE, avatarUrlField } from '../lib/avatar';
 import { randomInviteCode } from '../lib/inviteCode';
 import { assigneesInclude, columnSelect, createdBySelect, withAssignees } from '../lib/taskAssignees';
 import { canAny, createDefaultRoles, ensureProjectMember } from '../lib/permissions';
+import { emitToTeamMembers, emitToUser } from '../lib/socket';
 
-const createTeamSchema = z.object({ name: z.string().min(1), description: z.string().optional() });
+const createTeamSchema = z.object({
+  name: z.string().trim().min(1).max(60),
+  description: z.string().max(500).optional(),
+  avatarUrl: avatarUrlField,
+  memberUserIds: z.array(z.string().min(1)).optional(),
+});
 
 // Kode unik praktis: cek dulu, bentrok DB (P2002) → coba lagi. Maks 5x,
 // lalu fallback yang praktis mustahil tabrakan.
@@ -27,7 +33,11 @@ function isUniqueConflict(e: unknown) {
 export async function listMyTeams(req: Request, res: Response) {
   const teams = await prisma.team.findMany({
     where: { members: { some: { userId: req.userId } } },
-    include: { members: { include: { user: { select: { id: true, name: true, avatarUrl: true } } } } },
+    include: {
+      members: {
+        include: { user: { select: { id: true, name: true, email: true, avatarUrl: true } } },
+      },
+    },
   });
   // Kode invite + kedaluwarsa hanya untuk admin tim atau role kelola invite.
   const data = await Promise.all(
@@ -47,18 +57,45 @@ export async function listMyTeams(req: Request, res: Response) {
 export async function createTeam(req: Request, res: Response) {
   const body = createTeamSchema.parse(req.body);
   if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
+  if (body.avatarUrl !== undefined && body.avatarUrl !== null && !AVATAR_RE.test(body.avatarUrl)) {
+    return sendError(res, 422, 'URL avatar tidak valid');
+  }
+
+  const requestedIds = Array.from(
+    new Set((body.memberUserIds ?? []).filter((id) => id && id !== req.userId)),
+  );
+  let validMemberIds: string[] = [];
+  if (requestedIds.length > 0) {
+    const existingUsers = await prisma.user.findMany({
+      where: { id: { in: requestedIds } },
+      select: { id: true },
+    });
+    validMemberIds = existingUsers.map((u) => u.id);
+  }
 
   const team = await prisma.team.create({
     data: {
-      ...body,
+      name: body.name,
+      description: body.description,
+      avatarUrl: body.avatarUrl ?? undefined,
       inviteCode: await createUniqueInviteCode(),
       // Kode baru berlaku 7 hari agar tidak ada kode abadi yang bisa ditebak
       // kapan saja; admin bisa ubah/perpanjang dari tab Undang.
       inviteExpiresAt: new Date(Date.now() + 7 * 24 * 3600_000),
-      members: { create: { userId: req.userId, role: 'ADMIN' } },
+      members: {
+        create: [
+          { userId: req.userId, role: 'ADMIN' },
+          ...validMemberIds.map((userId) => ({ userId, role: 'MEMBER' as const })),
+        ],
+      },
     },
-    include: { members: true },
+    include: {
+      members: {
+        include: { user: { select: { id: true, name: true, email: true, avatarUrl: true } } },
+      },
+    },
   });
+  await emitToTeamMembers(team.id, 'team:updated', { teamId: team.id, action: 'CREATED' });
   return res.status(201).json({ success: true, data: team });
 }
 
@@ -86,11 +123,15 @@ export async function getTeam(req: Request, res: Response) {
 const updateTeamSchema = z.object({
   name: z.string().trim().min(1).max(60).optional(),
   description: z.string().max(500).nullable().optional(),
+  avatarUrl: avatarUrlField,
 });
 
 export async function updateTeam(req: Request, res: Response) {
   const body = updateTeamSchema.parse(req.body);
   if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
+  if (body.avatarUrl !== undefined && body.avatarUrl !== null && !AVATAR_RE.test(body.avatarUrl)) {
+    return sendError(res, 422, 'URL avatar tidak valid');
+  }
   const teamId = req.params.teamId;
   const membership = await prisma.teamMember.findFirst({
     where: { teamId, userId: req.userId },
@@ -100,6 +141,7 @@ export async function updateTeam(req: Request, res: Response) {
     .update({ where: { id: teamId }, data: { ...body } })
     .catch(() => null);
   if (!team) return sendError(res, 404, 'Tim tidak ditemukan');
+  await emitToTeamMembers(teamId, 'team:updated', { teamId, action: 'UPDATED' });
   return res.json({ success: true, data: team });
 }
 
@@ -111,7 +153,11 @@ export async function deleteTeam(req: Request, res: Response) {
   });
   if (!membership) return sendError(res, 403, 'Bukan anggota tim ini');
   if (membership.role !== 'ADMIN') return sendError(res, 403, 'Hanya admin tim yang bisa menghapus');
+  const members = await prisma.teamMember.findMany({ where: { teamId }, select: { userId: true } });
   await prisma.team.delete({ where: { id: teamId } }).catch(() => null);
+  for (const m of members) {
+    emitToUser(m.userId, 'team:updated', { teamId, action: 'DELETED' });
+  }
   return res.json({ success: true, data: { id: teamId } });
 }
 
@@ -266,6 +312,9 @@ async function decideJoinRequest(req: Request, res: Response, status: 'APPROVED'
           : `Permintaanmu bergabung ke tim "${jr.team.name}" ditolak admin.`,
     },
   });
+  if (status === 'APPROVED') {
+    await emitToTeamMembers(teamId, 'team:updated', { teamId, action: 'MEMBER_ADDED' }, [jr.userId]);
+  }
   return res.json({ success: true, data: updated });
 }
 
@@ -314,6 +363,7 @@ export async function addMember(req: Request, res: Response) {
   for (const p of projects) {
     await ensureProjectMember(p.id, user.id);
   }
+  await emitToTeamMembers(teamId, 'team:updated', { teamId, action: 'MEMBER_ADDED' }, [user.id]);
   return res.status(201).json({ success: true, data: member });
 }
 
@@ -331,6 +381,7 @@ export async function removeMember(req: Request, res: Response) {
     if (adminCount <= 1) return sendError(res, 422, 'Tidak bisa mengeluarkan satu-satunya admin');
   }
   await prisma.teamMember.delete({ where: { id: target.id } });
+  await emitToTeamMembers(teamId, 'team:updated', { teamId, action: 'MEMBER_REMOVED' }, [userId]);
   return res.json({ success: true, data: { userId } });
 }
 
@@ -459,5 +510,6 @@ export async function createProject(req: Request, res: Response) {
       }
     }
   }
+  await emitToTeamMembers(teamId, 'project:updated', { teamId, projectId: project.id, action: 'CREATED' });
   return res.status(201).json({ success: true, data: project });
 }

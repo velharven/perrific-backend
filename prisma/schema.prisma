@@ -103,6 +103,7 @@ model User {
   activityTargets TaskActivity[] @relation("ActivityTarget")
   dailyActivities DailyActivity[]
   dailyColumns DailyColumn[]
+  calendarLayoutPreferences CalendarLayoutPreference[]
   notifications  Notification[]
   comments       Comment[]
   notes          Note[]
@@ -114,6 +115,7 @@ model Team {
   id          String        @id @default(uuid())
   name        String
   description String?
+  avatarUrl   String?
   inviteCode  String?       @unique
   inviteExpiresAt DateTime? // null = tanpa batas waktu
   createdAt   DateTime      @default(now())
@@ -315,7 +317,9 @@ model DailyActivity {
   icon       String?        // emoji Notion-style (mis. "📝", "🎯")
   order      Float          @default(0)
   customValues Json?        // peta columnId -> nilai properti kustom (DailyColumn)
+  recurrence Json?          // aturan pengulangan kegiatan (freq, interval, byDays, byMonthDay, byWeekOfMonth, endType, untilDate, count)
   googleEventId String?     // ID event pada Google Calendar
+  color      String?        // ID warna Google Calendar ('1'..'11') atau custom hex
   createdAt  DateTime       @default(now())
   updatedAt  DateTime       @updatedAt
 
@@ -326,6 +330,20 @@ model DailyActivity {
   @@index([userId])
   @@index([date])
   @@map("daily_activities")
+}
+
+// Preferensi posisi kolom kalender per pengguna dan tanggal.
+model CalendarLayoutPreference {
+  userId   String
+  date     String @db.VarChar(10)
+  eventKey String @db.VarChar(512)
+  position Int
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, date, eventKey])
+  @@index([userId, date])
+  @@map("calendar_layout_preferences")
 }
 
 model ChecklistItem {
