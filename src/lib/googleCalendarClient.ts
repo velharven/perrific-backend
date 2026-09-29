@@ -275,6 +275,7 @@ interface RecurrenceRuleConfig {
   endType?: 'NEVER' | 'ON_DATE' | 'AFTER';
   untilDate?: string | null;
   count?: number | null;
+  excludeDates?: string[];
 }
 
 const RRULE_DAYS = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'] as const;
@@ -326,5 +327,15 @@ export function buildGoogleRecurrenceRule(raw: unknown): string[] | null {
     }
   }
 
-  return [`RRULE:${parts.join(';')}`];
+  const rules: string[] = [`RRULE:${parts.join(';')}`];
+  if (Array.isArray(rec.excludeDates) && rec.excludeDates.length > 0) {
+    const validExdates = rec.excludeDates
+      .map((d) => d.trim().replace(/-/g, '').slice(0, 8))
+      .filter((d) => /^\d{8}$/.test(d));
+    if (validExdates.length > 0) {
+      rules.push(`EXDATE;VALUE=DATE:${validExdates.join(',')}`);
+    }
+  }
+
+  return rules;
 }

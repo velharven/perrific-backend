@@ -156,6 +156,7 @@ const recurrenceSchema = z
     endType: z.enum(['NEVER', 'ON_DATE', 'AFTER']).default('NEVER'),
     untilDate: z.string().nullable().optional(),
     count: z.number().int().min(1).nullable().optional(),
+    excludeDates: z.array(z.string()).optional(),
   })
   .nullable()
   .optional();
