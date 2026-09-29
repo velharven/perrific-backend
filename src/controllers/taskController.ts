@@ -5,6 +5,8 @@ import { sendError } from '../lib/errors';
 import { assigneesInclude, columnSelect, createdBySelect, uniqIds, watchersInclude, withAssignees, withWatchers } from '../lib/taskAssignees';
 import { emitToTeamMembers, emitToUser } from '../lib/socket';
 import { can } from '../lib/permissions';
+import { withUserCalendarLock } from '../lib/calendarOperationLock';
+import { propagatePersonalTaskLocked, deletePersonalTaskSchedulesLocked } from '../lib/googleCalendarSync';
 
 export async function getTask(req: Request, res: Response) {
   const task = await prisma.task.findUnique({
@@ -28,6 +30,7 @@ export async function listMyAssignedTasks(req: Request, res: Response) {
   const tasks = await prisma.task.findMany({
     where: {
       project: {
+        NOT: { teamId: { startsWith: 'personal-' } },
         team: {
           members: { some: { userId: req.userId } },
         },
@@ -48,7 +51,7 @@ export async function listMyAssignedTasks(req: Request, res: Response) {
       },
       dailyActivities: {
         where: { userId: req.userId },
-        select: { id: true, date: true, startTime: true, endTime: true },
+        select: { id: true, date: true, startTime: true, endTime: true, allDay: true, calendarConnectionId: true, googleEventId: true },
       },
     },
     orderBy: [{ column: { order: 'asc' } }, { order: 'asc' }, { createdAt: 'desc' }],
@@ -62,7 +65,7 @@ export async function listMyAssignedTasks(req: Request, res: Response) {
 
 const updateTaskSchema = z.object({
   title: z.string().min(1).optional(),
-  description: z.string().optional(),
+  description: z.string().nullable().optional(),
   columnId: z.string().min(1).optional(),
   priority: z.enum(['LOW', 'MEDIUM', 'HIGH', 'URGENT']).optional(),
   assigneeIds: z.array(z.string()).optional(),
@@ -95,87 +98,94 @@ export async function updateTask(req: Request, res: Response) {
         ? sendError(res, 401, 'Tidak terautentikasi')
         : sendError(res, 403, 'Bukan anggota tim ini');
   }
-  const { assigneeIds, columnId, ...rest } = body;
-  const before = await prisma.task.findUnique({
-    where: { id: req.params.taskId },
-    select: {
-      projectId: true,
-      columnId: true,
-      approval: true,
-      assignees: { select: { userId: true } },
-      column: { select: { name: true } },
-    },
-  });
-  if (!before) return sendError(res, 404, 'Task tidak ditemukan');
-  // Task usulan yang belum disetujui tidak boleh pindah kolom (drag kanban).
-  if (columnId && before.approval !== 'APPROVED' && columnId !== before.columnId) {
-    return sendError(res, 422, 'Task belum disetujui admin sehingga belum bisa dipindah');
-  }
-  if (columnId && columnId !== before.columnId && checked.membership.role !== 'ADMIN') {
-    if (!(await can(req.userId, before.projectId, 'task.move'))) {
-      return sendError(res, 403, 'Role kamu tidak boleh memindah task');
-    }
-  }
-  // Task yang ditolak hanya boleh diubah admin (kreator tak terlacak di model).
-  if (before.approval === 'REJECTED' && checked.membership.role !== 'ADMIN') {
-    return sendError(res, 403, 'Task yang ditolak hanya bisa diubah admin');
-  }
-  if (columnId && columnId !== before.columnId) {
-    const target = await prisma.boardColumn.findFirst({
-      where: { id: columnId, projectId: before.projectId },
+  return withUserCalendarLock(req.userId!, async () => {
+    const { assigneeIds, columnId, ...rest } = body;
+    const before = await prisma.task.findUnique({
+      where: { id: req.params.taskId },
+      select: {
+        projectId: true,
+        columnId: true,
+        approval: true,
+        assignees: { select: { userId: true } },
+        column: { select: { name: true } },
+      },
     });
-    if (!target) return sendError(res, 422, 'Kolom tidak valid');
-  }
-  const task = await prisma.task.update({
-    where: { id: req.params.taskId },
-    data: {
-      ...rest,
-      ...(columnId ? { columnId } : {}),
-      dueDate: body.dueDate ? new Date(body.dueDate) : undefined,
-      ...(assigneeIds !== undefined
-        ? { assignees: { deleteMany: {}, create: uniqIds(assigneeIds).map((userId) => ({ userId })) } }
-        : {}),
-    },
-    include: { ...assigneesInclude, ...watchersInclude, ...createdBySelect, ...columnSelect },
-  });
-  // Catat riwayat untuk tab Activities: pindah card & perubahan assignee.
-  const actorId = req.userId!;
-  const logs: { kind: 'MOVED' | 'ASSIGNED' | 'UNASSIGNED'; fromColumn?: string | null; toColumn?: string | null; targetUserId?: string }[] = [];
-  if (before && columnId && columnId !== before.columnId) {
-    const target = await prisma.boardColumn.findUnique({ where: { id: columnId }, select: { name: true } });
-    logs.push({ kind: 'MOVED', fromColumn: before.column?.name ?? null, toColumn: target?.name ?? null });
-  }
-  if (assigneeIds !== undefined && before) {
-    const oldIds = before.assignees.map((a) => a.userId);
-    const newIds = uniqIds(assigneeIds);
-    for (const userId of newIds.filter((id) => !oldIds.includes(id))) {
-      logs.push({ kind: 'ASSIGNED', targetUserId: userId });
-      emitToUser(userId, 'task:assigned', { taskId: task.id, action: 'ASSIGNED' });
+    if (!before) return sendError(res, 404, 'Task tidak ditemukan');
+    // Task usulan yang belum disetujui tidak boleh pindah kolom (drag kanban).
+    if (columnId && before.approval !== 'APPROVED' && columnId !== before.columnId) {
+      return sendError(res, 422, 'Task belum disetujui admin sehingga belum bisa dipindah');
     }
-    for (const userId of oldIds.filter((id) => !newIds.includes(id))) {
-      logs.push({ kind: 'UNASSIGNED', targetUserId: userId });
-      emitToUser(userId, 'task:assigned', { taskId: task.id, action: 'UNASSIGNED' });
+    if (columnId && columnId !== before.columnId && checked.membership.role !== 'ADMIN') {
+      if (!(await can(req.userId, before.projectId, 'task.move'))) {
+        return sendError(res, 403, 'Role kamu tidak boleh memindah task');
+      }
     }
-    for (const userId of newIds.filter((id) => oldIds.includes(id))) {
-      emitToUser(userId, 'task:assigned', { taskId: task.id, action: 'UPDATED' });
+    // Task yang ditolak hanya boleh diubah admin (kreator tak terlacak di model).
+    if (before.approval === 'REJECTED' && checked.membership.role !== 'ADMIN') {
+      return sendError(res, 403, 'Task yang ditolak hanya bisa diubah admin');
     }
-  } else if (before) {
-    for (const a of before.assignees) {
-      emitToUser(a.userId, 'task:assigned', { taskId: task.id, action: 'UPDATED' });
+    if (columnId && columnId !== before.columnId) {
+      const target = await prisma.boardColumn.findFirst({
+        where: { id: columnId, projectId: before.projectId },
+      });
+      if (!target) return sendError(res, 422, 'Kolom tidak valid');
     }
-  }
-  if (logs.length > 0) {
-    await prisma.taskActivity.createMany({
-      data: logs.map((l) => ({ taskId: task.id, actorId, ...l })),
+    let task = await prisma.task.update({
+      where: { id: req.params.taskId },
+      data: {
+        ...rest,
+        ...(columnId ? { columnId } : {}),
+        dueDate: body.dueDate ? new Date(body.dueDate) : undefined,
+        ...(assigneeIds !== undefined
+          ? { assignees: { deleteMany: {}, create: uniqIds(assigneeIds).map((userId) => ({ userId })) } }
+          : {}),
+      },
+      include: { ...assigneesInclude, ...watchersInclude, ...createdBySelect, ...columnSelect },
     });
-  }
-  await emitToTeamMembers(checked.membership.teamId, 'task:updated', {
-    taskId: task.id,
-    projectId: task.projectId,
-    teamId: checked.membership.teamId,
-    action: 'UPDATED',
+    await propagatePersonalTaskLocked(req.userId!, task.id, {
+      ...(body.title !== undefined ? { title: body.title } : {}),
+      ...(body.description !== undefined ? { description: body.description } : {}),
+    });
+    task = await prisma.task.findUniqueOrThrow({ where: { id: task.id }, include: { ...assigneesInclude, ...watchersInclude, ...createdBySelect, ...columnSelect } });
+    // Catat riwayat untuk tab Activities: pindah card & perubahan assignee.
+    const actorId = req.userId!;
+    const logs: { kind: 'MOVED' | 'ASSIGNED' | 'UNASSIGNED'; fromColumn?: string | null; toColumn?: string | null; targetUserId?: string }[] = [];
+    if (before && columnId && columnId !== before.columnId) {
+      const target = await prisma.boardColumn.findUnique({ where: { id: columnId }, select: { name: true } });
+      logs.push({ kind: 'MOVED', fromColumn: before.column?.name ?? null, toColumn: target?.name ?? null });
+    }
+    if (assigneeIds !== undefined && before) {
+      const oldIds = before.assignees.map((a) => a.userId);
+      const newIds = uniqIds(assigneeIds);
+      for (const userId of newIds.filter((id) => !oldIds.includes(id))) {
+        logs.push({ kind: 'ASSIGNED', targetUserId: userId });
+        emitToUser(userId, 'task:assigned', { taskId: task.id, action: 'ASSIGNED' });
+      }
+      for (const userId of oldIds.filter((id) => !newIds.includes(id))) {
+        logs.push({ kind: 'UNASSIGNED', targetUserId: userId });
+        emitToUser(userId, 'task:assigned', { taskId: task.id, action: 'UNASSIGNED' });
+      }
+      for (const userId of newIds.filter((id) => oldIds.includes(id))) {
+        emitToUser(userId, 'task:assigned', { taskId: task.id, action: 'UPDATED' });
+      }
+    } else if (before) {
+      for (const a of before.assignees) {
+        emitToUser(a.userId, 'task:assigned', { taskId: task.id, action: 'UPDATED' });
+      }
+    }
+    if (logs.length > 0) {
+      await prisma.taskActivity.createMany({
+        data: logs.map((l) => ({ taskId: task.id, actorId, ...l })),
+      });
+    }
+    await emitToTeamMembers(checked.membership.teamId, 'task:updated', {
+      taskId: task.id,
+      projectId: task.projectId,
+      teamId: checked.membership.teamId,
+      action: 'UPDATED',
+    });
+    return res.json({ success: true, data: withWatchers(withAssignees(task)) });
   });
-  return res.json({ success: true, data: withWatchers(withAssignees(task)) });
 }
 
 export async function deleteTask(req: Request, res: Response) {
@@ -193,21 +203,24 @@ export async function deleteTask(req: Request, res: Response) {
       return sendError(res, 403, 'Hanya yang berhak yang bisa menghapus task');
     }
   }
-  const taskBefore = await prisma.task.findUnique({
-    where: { id: req.params.taskId },
-    select: { projectId: true, assignees: { select: { userId: true } } },
+  return withUserCalendarLock(req.userId!, async () => {
+    const taskBefore = await prisma.task.findUnique({
+      where: { id: req.params.taskId },
+      select: { projectId: true, assignees: { select: { userId: true } } },
+    });
+    await deletePersonalTaskSchedulesLocked(req.userId!, req.params.taskId);
+    await prisma.task.delete({ where: { id: req.params.taskId } });
+    for (const a of taskBefore?.assignees ?? []) {
+      emitToUser(a.userId, 'task:assigned', { taskId: req.params.taskId, action: 'UNASSIGNED' });
+    }
+    await emitToTeamMembers(checked.membership.teamId, 'task:updated', {
+      taskId: req.params.taskId,
+      projectId: taskBefore?.projectId,
+      teamId: checked.membership.teamId,
+      action: 'DELETED',
+    });
+    return res.json({ success: true, data: { id: req.params.taskId } });
   });
-  await prisma.task.delete({ where: { id: req.params.taskId } });
-  for (const a of taskBefore?.assignees ?? []) {
-    emitToUser(a.userId, 'task:assigned', { taskId: req.params.taskId, action: 'UNASSIGNED' });
-  }
-  await emitToTeamMembers(checked.membership.teamId, 'task:updated', {
-    taskId: req.params.taskId,
-    projectId: taskBefore?.projectId,
-    teamId: checked.membership.teamId,
-    action: 'DELETED',
-  });
-  return res.json({ success: true, data: { id: req.params.taskId } });
 }
 
 const addCommentSchema = z.object({ content: z.string().min(1) });

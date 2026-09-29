@@ -13,10 +13,12 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:seed": "prisma db seed",
-    "prisma:studio": "prisma studio"
+    "prisma:studio": "prisma studio",
+    "test": "tsx --test src/lib/*.test.ts",
+    "test:calendar-live": "tsx scripts/verifyCalendarSync.ts"
   },
   "prisma": {
-    "seed": "tsx prisma/seed.ts"  
+    "seed": "tsx prisma/seed.ts"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",

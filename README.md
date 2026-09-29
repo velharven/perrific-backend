@@ -91,6 +91,16 @@ Layanan backend berjalan di `http://localhost:4000`.
 | `npm run prisma:migrate` | Menjalankan migrasi skema database Prisma dalam mode pengembangan. |
 | `npm run prisma:seed` | Menjalankan pengisian data awal dari `prisma/seed.ts`. |
 | `npm run prisma:studio` | Membuka antarmuka grafis Prisma Studio untuk melihat dan mengedit data tabel di browser. |
+| `npm test` | Menjalankan tes merge, antrean per pengguna, dan sinkronisasi kalender. |
+| `npm run test:calendar-live` | Memeriksa integrasi dua arah dengan akun Google yang terhubung menggunakan tugas dan event sementara. |
+
+## Pemeriksaan Google Calendar
+
+Jalankan migrasi dan `npm run prisma:generate` sebelum tes. `npm test` menggunakan PostgreSQL dari `.env`, membuat pengguna fixture terpisah, dan membersihkannya setelah tes. Permintaan Google pada tes tersebut menggunakan mock.
+
+Untuk pemeriksaan langsung, jalankan backend dan `npm run test:calendar-live`. Pemeriksaan ini membutuhkan `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, dan satu akun Google Calendar yang sudah terhubung. Jika terdapat beberapa akun, tentukan `CALENDAR_TEST_USER_ID`. Script membuat tugas pribadi dan event sementara, memeriksa perubahan dari project, Daily, dan Google beserta penghapusannya, lalu membersihkan fixture.
+
+Sinkronisasi berjalan saat kartu berubah, kalender dibuka, akun Google berganti, aplikasi kembali aktif, atau jaringan tersambung. Tidak ada polling 30 detik. Perubahan lokal mengirim hanya event yang terkait; perubahan Google memakai syncToken per koneksi dengan baseline canonical singleEvents=false. Baseline awal dimuat di latar belakang setelah rentang tampilan siap. Jadwal dan jurnal akun lama disimpan terpisah dan kembali saat akun itu dihubungkan lagi. Tautan lama tanpa pemilik diverifikasi sebelum dihubungkan; tidak dikirim atau dihapus melalui akun baru. Perubahan lokal dicatat sebelum dikirim, sehingga kegagalan jaringan dapat dicoba kembali tanpa membuat event duplikat. Konflik pada field yang sama mengikuti waktu perubahan terbaru; perubahan pada field berbeda digabungkan. Penghapusan jadwal mempertahankan tugas asal untuk dijadwalkan ulang.
 
 ## Dokumentasi arsitektur
 

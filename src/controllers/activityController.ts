@@ -4,11 +4,21 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { sendError } from '../lib/errors';
 import {
-  pushActivityToGoogleCalendar,
-  deleteEventFromGoogleCalendar,
-} from './googleCalendarController';
-import { emitToUser } from '../lib/socket';
+  notifyCalendarChangedLocked,
+  syncActivityLocked,
+  markCalendarChangedLocked,
+  changedCalendarFields,
+  propagatePersonalActivityLocked,
+  queueCalendarDeleteLocked,
+  flushCalendarDeleteLocked,
+  detachCalendarScheduleLocked,
+} from '../lib/googleCalendarSync';
 import { withUserCalendarLock } from '../lib/calendarOperationLock';
+import {
+  assertConnection,
+  expectedConnection,
+  calendarActivityScope,
+} from '../lib/calendarConnection';
 
 // ============ Helpers ============
 function parseLocalDate(s: string): Date | null {
@@ -78,12 +88,12 @@ export async function listMyActivities(req: Request, res: Response) {
   // bisa dioverride via ?limit= (maks 500).
   const rawLimit = Number((req.query as Record<string, unknown>).limit);
   const take =
-    Number.isFinite(rawLimit) && rawLimit > 0
-      ? Math.min(Math.floor(rawLimit), 500)
-      : 100;
+    Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 500) : 100;
 
   const where: Record<string, unknown> = { userId: req.userId };
   const andConditions: Record<string, unknown>[] = [];
+  const connectionId = await assertConnection(req.userId, expectedConnection(req));
+  if (req.query.calendarScope === 'active') andConditions.push(calendarActivityScope(connectionId));
 
   if (gte || lt) {
     andConditions.push({
@@ -128,7 +138,7 @@ export async function listMyActivities(req: Request, res: Response) {
     take,
   });
 
-  return res.json({ success: true, data: activities });
+  return res.json({ success: true, data: activities, connectionId });
 }
 
 const recurrenceSchema = z
@@ -153,25 +163,27 @@ const recurrenceSchema = z
 // ============ Create (supports inline checklist & icon/ordering) ============
 const createActivitySchema = z.object({
   title: z.string().min(1),
-  description: z.string().optional(),
+  description: z.string().nullable().optional(),
   date: z.string().datetime().or(z.string().min(1)), // allow YYYY-MM-DD too
-  startTime: z.string().datetime().optional().or(z.string().optional()),
-  endTime: z.string().datetime().optional().or(z.string().optional()),
+  startTime: z.string().nullable().optional(),
+  endTime: z.string().nullable().optional(),
+  allDay: z.boolean().optional(),
   type: z.enum(['TASK', 'BREAKDOWN', 'CUSTOM']).default('CUSTOM'),
   status: z.enum(['PENDING', 'COMPLETED', 'SKIPPED']).optional(),
   taskId: z.string().optional(),
   icon: z.string().max(8).optional(),
   order: z.number().optional(),
   createdAt: z.string().datetime().optional().or(z.string().optional()),
-  customValues: z.record(z.union([z.string(), z.number(), z.boolean()])).nullable().optional(),
+  customValues: z
+    .record(z.union([z.string(), z.number(), z.boolean()]))
+    .nullable()
+    .optional(),
   recurrence: recurrenceSchema,
   color: z.string().nullable().optional(),
-  checklist: z
-    .array(z.object({ text: z.string().min(1) }))
-    .optional(),
+  checklist: z.array(z.object({ text: z.string().min(1) })).optional(),
 });
 
-function parseOptionalDate(value?: string): Date | null | undefined {
+function parseOptionalDate(value?: string | null): Date | null | undefined {
   if (value === undefined) return undefined;
   if (value === null) return null;
   if (value === '') return null;
@@ -183,64 +195,86 @@ function parseOptionalDate(value?: string): Date | null | undefined {
 export async function createActivity(req: Request, res: Response) {
   const body = createActivitySchema.parse(req.body);
   if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
-
-  const date = parseOptionalDate(body.date) as Date | undefined;
-  if (!date) return sendError(res, 422, 'Format tanggal tidak valid');
-
-  const createdAtDate = parseOptionalDate(body.createdAt);
-
-  const activity = await prisma.dailyActivity.create({
-    data: {
-      userId: req.userId,
-      title: body.title,
-      description: body.description,
-      date,
-      startTime: parseOptionalDate(body.startTime) ?? null,
-      endTime: parseOptionalDate(body.endTime) ?? null,
-      type: body.type,
-      status: body.status ?? 'PENDING',
-      taskId: body.taskId,
-      icon: body.icon,
-      order: body.order ?? 0,
-      createdAt: createdAtDate ?? undefined,
-      customValues: (body.customValues ?? undefined) as unknown as Prisma.InputJsonValue | undefined,
-      color: body.color ?? null,
-      recurrence:
-        body.recurrence === null
-          ? Prisma.DbNull
-          : ((body.recurrence ?? undefined) as unknown as Prisma.InputJsonValue | undefined),
-      checklistItems: body.checklist
-        ? {
-            create: body.checklist.map((c, idx) => ({
-              text: c.text,
-              order: idx,
-            })),
-          }
-        : undefined,
-    },
-    include: {
-      checklistItems: { orderBy: { order: 'asc' } },
-      task: { select: { id: true, title: true } },
-    },
-  });
-
-  // Otomatis sinkronkan ke Google Calendar jika akun terhubung dan aktivitas memiliki jam pelaksanaan
-  if (activity.startTime) {
-    try {
-      const gId = await pushActivityToGoogleCalendar(req.userId, activity.id);
-      if (gId) activity.googleEventId = gId;
-    } catch (err) {
-      console.error('[activityController] Gagal auto-push ke Google Calendar:', err);
+  const userId = req.userId;
+  return withUserCalendarLock(userId, async () => {
+    await assertConnection(userId, expectedConnection(req));
+    let sourceTask: { title: string; description: string | null } | null = null;
+    if (body.taskId) {
+      const task = await prisma.task.findFirst({
+        where: { id: body.taskId, project: { team: { members: { some: { userId } } } } },
+        include: { project: { select: { teamId: true } } },
+      });
+      if (!task) return sendError(res, 403, 'Tugas tidak tersedia untuk pengguna ini.');
+      if (task.project.teamId === `personal-${userId}`) sourceTask = task;
     }
 
-    emitToUser(req.userId, 'calendar:synced', {
+    const date = parseOptionalDate(body.date) as Date | undefined;
+    if (!date) return sendError(res, 422, 'Format tanggal tidak valid');
+
+    const createdAtDate = parseOptionalDate(body.createdAt);
+
+    const activity = await prisma.dailyActivity.create({
+      data: {
+        userId,
+        title: sourceTask?.title || body.title,
+        description: sourceTask ? sourceTask.description : body.description,
+        date,
+        startTime: parseOptionalDate(body.startTime) ?? null,
+        endTime: parseOptionalDate(body.endTime) ?? null,
+        allDay: body.allDay ?? false,
+        type: body.type,
+        status: body.status ?? 'PENDING',
+        taskId: body.taskId,
+        icon: body.icon,
+        order: body.order ?? 0,
+        createdAt: createdAtDate ?? undefined,
+        customValues: (body.customValues ?? undefined) as unknown as
+          Prisma.InputJsonValue | undefined,
+        color: body.color ?? null,
+        recurrence:
+          body.recurrence === null
+            ? Prisma.DbNull
+            : ((body.recurrence ?? undefined) as unknown as Prisma.InputJsonValue | undefined),
+        checklistItems: body.checklist
+          ? {
+              create: body.checklist.map((c, idx) => ({
+                text: c.text,
+                order: idx,
+              })),
+            }
+          : undefined,
+      },
+      include: {
+        checklistItems: { orderBy: { order: 'asc' } },
+        task: { select: { id: true, title: true } },
+      },
+    });
+
+    if (activity.startTime || activity.allDay) {
+      await markCalendarChangedLocked(activity, [
+        'title',
+        'description',
+        'start',
+        'end',
+        'recurrence',
+        'color',
+        'checklist',
+      ]);
+      await syncActivityLocked(userId, activity.id);
+    }
+    const calendarMeta = await notifyCalendarChangedLocked(userId, {
       action: 'create',
       activityId: activity.id,
-      googleEventId: activity.googleEventId,
     });
-  }
-
-  return res.status(201).json({ success: true, data: activity });
+    const saved = await prisma.dailyActivity.findUnique({
+      where: { id: activity.id },
+      include: {
+        checklistItems: { orderBy: { order: 'asc' } },
+        task: { select: { id: true, title: true } },
+      },
+    });
+    return res.status(201).json({ success: true, ...calendarMeta, data: saved });
+  });
 }
 
 // ============ Update ============
@@ -250,6 +284,7 @@ const updateActivitySchema = z.object({
   date: z.string().optional(),
   startTime: z.string().datetime().nullable().optional().or(z.string().nullable().optional()),
   endTime: z.string().datetime().nullable().optional().or(z.string().nullable().optional()),
+  allDay: z.boolean().optional(),
   status: z.enum(['PENDING', 'COMPLETED', 'SKIPPED']).optional(),
   icon: z.string().max(8).nullable().optional(),
   order: z.number().optional(),
@@ -261,63 +296,76 @@ const updateActivitySchema = z.object({
 export async function updateActivity(req: Request, res: Response) {
   if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
   const body = updateActivitySchema.parse(req.body);
+  const userId = req.userId;
+  return withUserCalendarLock(userId, async () => {
+    await assertConnection(userId, expectedConnection(req));
 
-  const existing = await prisma.dailyActivity.findFirst({
-    where: { id: req.params.activityId, userId: req.userId },
+    const existing = await prisma.dailyActivity.findFirst({
+      where: { id: req.params.activityId, userId },
+      include: { checklistItems: true },
+    });
+    if (!existing) return sendError(res, 404, 'Aktivitas tidak ditemukan');
+
+    const fields = changedCalendarFields(body, existing);
+    await markCalendarChangedLocked(existing, fields);
+    const unscheduling = body.startTime === null && !body.allDay && Boolean(existing.startTime);
+    if (unscheduling) await detachCalendarScheduleLocked(existing);
+    const data: Record<string, unknown> = {};
+    if (body.allDay !== undefined) data.allDay = body.allDay;
+    if (unscheduling) data.googleEventId = null;
+    if (body.startTime) data.allDay = false;
+    if (body.title !== undefined) data.title = body.title;
+    if (body.description !== undefined) data.description = body.description;
+    if (body.status !== undefined) data.status = body.status;
+    if (body.icon !== undefined) data.icon = body.icon;
+    if (body.order !== undefined) data.order = body.order;
+    if (body.type !== undefined) data.type = body.type;
+    if (body.color !== undefined) data.color = body.color;
+    if (body.recurrence !== undefined) {
+      data.recurrence =
+        body.recurrence === null
+          ? Prisma.DbNull
+          : (body.recurrence as unknown as Prisma.InputJsonValue);
+    }
+    if (body.date !== undefined) {
+      const d = parseOptionalDate(body.date);
+      if (d) data.date = d;
+    }
+    if (body.startTime !== undefined) {
+      const v = body.startTime === null ? null : parseOptionalDate(body.startTime);
+      data.startTime = v ?? null;
+    }
+    if (body.endTime !== undefined) {
+      const v = body.endTime === null ? null : parseOptionalDate(body.endTime);
+      data.endTime = v ?? null;
+    }
+
+    const activity = await prisma.dailyActivity.update({
+      where: { id: req.params.activityId },
+      data,
+      include: {
+        checklistItems: { orderBy: { order: 'asc' } },
+        task: { select: { id: true, title: true } },
+      },
+    });
+
+    await propagatePersonalActivityLocked(activity, fields);
+    if (fields.length && !unscheduling) await syncActivityLocked(userId, activity.id);
+    const calendarMeta = await notifyCalendarChangedLocked(userId, {
+      action: 'update',
+      activityId: activity.id,
+      googleEventId: activity.googleEventId,
+    });
+
+    const saved = await prisma.dailyActivity.findUnique({
+      where: { id: activity.id },
+      include: {
+        checklistItems: { orderBy: { order: 'asc' } },
+        task: { select: { id: true, title: true } },
+      },
+    });
+    return res.json({ success: true, ...calendarMeta, data: saved });
   });
-  if (!existing) return sendError(res, 404, 'Aktivitas tidak ditemukan');
-
-  const data: Record<string, unknown> = {};
-  if (body.title !== undefined) data.title = body.title;
-  if (body.description !== undefined) data.description = body.description;
-  if (body.status !== undefined) data.status = body.status;
-  if (body.icon !== undefined) data.icon = body.icon;
-  if (body.order !== undefined) data.order = body.order;
-  if (body.type !== undefined) data.type = body.type;
-  if (body.color !== undefined) data.color = body.color;
-  if (body.recurrence !== undefined) {
-    data.recurrence =
-      body.recurrence === null
-        ? Prisma.DbNull
-        : (body.recurrence as unknown as Prisma.InputJsonValue);
-  }
-  if (body.date !== undefined) {
-    const d = parseOptionalDate(body.date);
-    if (d) data.date = d;
-  }
-  if (body.startTime !== undefined) {
-    const v = body.startTime === null ? null : parseOptionalDate(body.startTime);
-    data.startTime = v ?? null;
-  }
-  if (body.endTime !== undefined) {
-    const v = body.endTime === null ? null : parseOptionalDate(body.endTime);
-    data.endTime = v ?? null;
-  }
-
-  const activity = await prisma.dailyActivity.update({
-    where: { id: req.params.activityId },
-    data,
-    include: {
-      checklistItems: { orderBy: { order: 'asc' } },
-      task: { select: { id: true, title: true } },
-    },
-  });
-
-  // Otomatis sinkronkan pembaruan ke Google Calendar jika terhubung (tunggu agar googleEventId langsung tersedia)
-  try {
-    const gId = await pushActivityToGoogleCalendar(req.userId, activity.id);
-    if (gId) activity.googleEventId = gId;
-  } catch (err) {
-    console.error('[activityController] Gagal auto-update ke Google Calendar:', err);
-  }
-
-  emitToUser(req.userId, 'calendar:synced', {
-    action: 'update',
-    activityId: activity.id,
-    googleEventId: activity.googleEventId,
-  });
-
-  return res.json({ success: true, data: activity });
 }
 
 // Backward compat: typo alias
@@ -327,31 +375,22 @@ export async function deleteActivity(req: Request, res: Response) {
   if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
   const userId = req.userId;
   return withUserCalendarLock(userId, async () => {
+    await assertConnection(userId, expectedConnection(req));
     const existing = await prisma.dailyActivity.findFirst({
       where: { id: req.params.activityId, userId },
     });
     if (!existing) return sendError(res, 404, 'Aktivitas tidak ditemukan');
 
-    // Aktivitas tertaut hanya boleh hilang lokal setelah Google mengonfirmasi
-    // penghapusan kejadian yang sama.
-    if (existing.googleEventId) {
-      const removedFromGoogle = await deleteEventFromGoogleCalendar(userId, existing.googleEventId, {
-        date: existing.date,
-        startTime: existing.startTime,
-      });
-      if (!removedFromGoogle) {
-        return sendError(res, 502, 'Gagal menghapus kegiatan dari Google Calendar. Coba lagi.');
-      }
-    }
-
-    await prisma.dailyActivity.delete({ where: { id: req.params.activityId } });
-    emitToUser(userId, 'calendar:synced', {
+    await queueCalendarDeleteLocked(existing);
+    await flushCalendarDeleteLocked(userId, existing.id);
+    const calendarMeta = await notifyCalendarChangedLocked(userId, {
       action: 'delete',
       activityId: req.params.activityId,
       googleEventId: existing.googleEventId,
     });
     return res.json({
       success: true,
+      ...calendarMeta,
       data: { id: req.params.activityId, googleEventId: existing.googleEventId },
     });
   });
@@ -362,28 +401,39 @@ const addChecklistSchema = z.object({ text: z.string().min(1) });
 
 export async function addChecklistItem(req: Request, res: Response) {
   if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
-  const body = addChecklistSchema.parse(req.body);
-  const activityId = req.params.activityId;
+  const userId = req.userId;
+  return withUserCalendarLock(userId, async () => {
+    await assertConnection(userId, expectedConnection(req));
+    const body = addChecklistSchema.parse(req.body);
+    const activityId = req.params.activityId;
 
-  const activity = await prisma.dailyActivity.findFirst({
-    where: { id: activityId, userId: req.userId },
+    const activity = await prisma.dailyActivity.findFirst({
+      where: { id: activityId, userId },
+      include: { checklistItems: { orderBy: { order: 'asc' } } },
+    });
+    if (!activity) return sendError(res, 404, 'Aktivitas tidak ditemukan');
+
+    await markCalendarChangedLocked(activity, ['checklist']);
+    const maxOrder = await prisma.checklistItem.aggregate({
+      where: { activityId },
+      _max: { order: true },
+    });
+
+    const item = await prisma.checklistItem.create({
+      data: {
+        activityId,
+        text: body.text,
+        order: (maxOrder._max.order ?? -1) + 1,
+      },
+    });
+
+    await syncActivityLocked(userId, activity.id);
+    const calendarMeta = await notifyCalendarChangedLocked(userId, {
+      action: 'update',
+      activityId: activity.id,
+    });
+    return res.status(201).json({ success: true, ...calendarMeta, data: item });
   });
-  if (!activity) return sendError(res, 404, 'Aktivitas tidak ditemukan');
-
-  const maxOrder = await prisma.checklistItem.aggregate({
-    where: { activityId },
-    _max: { order: true },
-  });
-
-  const item = await prisma.checklistItem.create({
-    data: {
-      activityId,
-      text: body.text,
-      order: (maxOrder._max.order ?? -1) + 1,
-    },
-  });
-
-  return res.status(201).json({ success: true, data: item });
 }
 
 const updateChecklistSchema = z.object({
@@ -394,39 +444,61 @@ const updateChecklistSchema = z.object({
 
 export async function updateChecklistItem(req: Request, res: Response) {
   if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
-  const body = updateChecklistSchema.parse(req.body);
-  const itemId = req.params.itemId;
+  const userId = req.userId;
+  return withUserCalendarLock(userId, async () => {
+    await assertConnection(userId, expectedConnection(req));
+    const body = updateChecklistSchema.parse(req.body);
+    const itemId = req.params.itemId;
 
-  const item = await prisma.checklistItem.findUnique({
-    where: { id: itemId },
-    include: { activity: true },
+    const item = await prisma.checklistItem.findUnique({
+      where: { id: itemId },
+      include: { activity: { include: { checklistItems: { orderBy: { order: 'asc' } } } } },
+    });
+    if (!item || item.activity.userId !== userId)
+      return sendError(res, 404, 'Item tidak ditemukan');
+
+    await markCalendarChangedLocked(item.activity, ['checklist']);
+    const updated = await prisma.checklistItem.update({
+      where: { id: itemId },
+      data: {
+        ...(body.text !== undefined ? { text: body.text } : {}),
+        ...(body.completed !== undefined ? { completed: body.completed } : {}),
+        ...(body.order !== undefined ? { order: body.order } : {}),
+      },
+    });
+
+    await syncActivityLocked(userId, item.activity.id);
+    const calendarMeta = await notifyCalendarChangedLocked(userId, {
+      action: 'update',
+      activityId: item.activity.id,
+    });
+    return res.json({ success: true, ...calendarMeta, data: updated });
   });
-  if (!item || item.activity.userId !== req.userId) return sendError(res, 404, 'Item tidak ditemukan');
-
-  const updated = await prisma.checklistItem.update({
-    where: { id: itemId },
-    data: {
-      ...(body.text !== undefined ? { text: body.text } : {}),
-      ...(body.completed !== undefined ? { completed: body.completed } : {}),
-      ...(body.order !== undefined ? { order: body.order } : {}),
-    },
-  });
-
-  return res.json({ success: true, data: updated });
 }
 
 export async function deleteChecklistItem(req: Request, res: Response) {
   if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
-  const itemId = req.params.itemId;
+  const userId = req.userId;
+  return withUserCalendarLock(userId, async () => {
+    await assertConnection(userId, expectedConnection(req));
+    const itemId = req.params.itemId;
 
-  const item = await prisma.checklistItem.findUnique({
-    where: { id: itemId },
-    include: { activity: true },
+    const item = await prisma.checklistItem.findUnique({
+      where: { id: itemId },
+      include: { activity: { include: { checklistItems: { orderBy: { order: 'asc' } } } } },
+    });
+    if (!item || item.activity.userId !== userId)
+      return sendError(res, 404, 'Item tidak ditemukan');
+
+    await markCalendarChangedLocked(item.activity, ['checklist']);
+    await prisma.checklistItem.delete({ where: { id: itemId } });
+    await syncActivityLocked(userId, item.activity.id);
+    const calendarMeta = await notifyCalendarChangedLocked(userId, {
+      action: 'update',
+      activityId: item.activity.id,
+    });
+    return res.json({ success: true, ...calendarMeta, data: { id: itemId } });
   });
-  if (!item || item.activity.userId !== req.userId) return sendError(res, 404, 'Item tidak ditemukan');
-
-  await prisma.checklistItem.delete({ where: { id: itemId } });
-  return res.json({ success: true, data: { id: itemId } });
 }
 
 // Reorder activities (drag-and-drop order persist)
@@ -442,7 +514,8 @@ export async function reorderActivities(req: Request, res: Response) {
   const count = await prisma.dailyActivity.count({
     where: { id: { in: body.orderedIds }, userId: req.userId },
   });
-  if (count !== body.orderedIds.length) return sendError(res, 403, 'Beberapa aktivitas tidak valid');
+  if (count !== body.orderedIds.length)
+    return sendError(res, 403, 'Beberapa aktivitas tidak valid');
 
   await prisma.$transaction(
     body.orderedIds.map((id, idx) =>
@@ -456,43 +529,66 @@ export async function reorderActivities(req: Request, res: Response) {
 // Duplicate an activity (Notion-style duplicate block)
 export async function duplicateActivity(req: Request, res: Response) {
   if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
+  const userId = req.userId;
+  return withUserCalendarLock(userId, async () => {
+    await assertConnection(userId, expectedConnection(req));
 
-  const source = await prisma.dailyActivity.findFirst({
-    where: { id: req.params.activityId, userId: req.userId },
-    include: { checklistItems: true },
-  });
-  if (!source) return sendError(res, 404, 'Aktivitas tidak ditemukan');
+    const source = await prisma.dailyActivity.findFirst({
+      where: { id: req.params.activityId, userId },
+      include: { checklistItems: true },
+    });
+    if (!source) return sendError(res, 404, 'Aktivitas tidak ditemukan');
 
-  const copy = await prisma.dailyActivity.create({
-    data: {
-      userId: req.userId,
-      title: `${source.title} (copy)`,
-      description: source.description,
-      date: source.date,
-      startTime: source.startTime,
-      endTime: source.endTime,
-      type: source.type,
-      status: 'PENDING',
-      icon: source.icon,
-      order: source.order + 0.5,
-      taskId: source.taskId,
-      customValues: source.customValues ?? undefined,
-      recurrence: (source.recurrence ?? undefined) as unknown as Prisma.InputJsonValue | undefined,
-      checklistItems: {
-        create: source.checklistItems.map((c) => ({
-          text: c.text,
-          completed: false,
-          order: c.order,
-        })),
+    const copy = await prisma.dailyActivity.create({
+      data: {
+        userId,
+        title: `${source.title} (copy)`,
+        description: source.description,
+        date: source.date,
+        startTime: source.startTime,
+        endTime: source.endTime,
+        allDay: source.allDay,
+        type: source.type,
+        status: 'PENDING',
+        icon: source.icon,
+        order: source.order + 0.5,
+        taskId: source.taskId,
+        customValues: source.customValues ?? undefined,
+        recurrence: (source.recurrence ?? undefined) as unknown as
+          Prisma.InputJsonValue | undefined,
+        checklistItems: {
+          create: source.checklistItems.map((c) => ({
+            text: c.text,
+            completed: false,
+            order: c.order,
+          })),
+        },
       },
-    },
-    include: {
-      checklistItems: { orderBy: { order: 'asc' } },
-      task: { select: { id: true, title: true } },
-    },
-  });
+      include: {
+        checklistItems: { orderBy: { order: 'asc' } },
+        task: { select: { id: true, title: true } },
+      },
+    });
 
-  return res.status(201).json({ success: true, data: copy });
+    if (copy.startTime || copy.allDay) {
+      await markCalendarChangedLocked(copy, ['title', 'description', 'start', 'end', 'checklist']);
+      await syncActivityLocked(userId, copy.id);
+    }
+    const calendarMeta = await notifyCalendarChangedLocked(userId, {
+      action: 'create',
+      activityId: copy.id,
+    });
+    return res
+      .status(201)
+      .json({
+        success: true,
+        ...calendarMeta,
+        data: await prisma.dailyActivity.findUnique({
+          where: { id: copy.id },
+          include: { checklistItems: true },
+        }),
+      });
+  });
 }
 
 const dailyColumnTypes = [
@@ -630,7 +726,9 @@ export async function reorderColumns(req: Request, res: Response) {
   });
   if (count !== body.orderedIds.length) return sendError(res, 403, 'Beberapa properti tidak valid');
   await prisma.$transaction(
-    body.orderedIds.map((id, idx) => prisma.dailyColumn.update({ where: { id }, data: { order: idx } })),
+    body.orderedIds.map((id, idx) =>
+      prisma.dailyColumn.update({ where: { id }, data: { order: idx } }),
+    ),
   );
   return res.json({ success: true, data: { orderedIds: body.orderedIds } });
 }
@@ -653,14 +751,17 @@ function normalizeCellValue(
     case 'PHONE':
       // Kolom telepon bisa menyimpan format apapun: teks huruf, angka acak, simbol, spasi, dsb.
       if (typeof value === 'string') return { ok: true, normalized: value };
-      if (typeof value === 'number' || typeof value === 'boolean') return { ok: true, normalized: String(value) };
+      if (typeof value === 'number' || typeof value === 'boolean')
+        return { ok: true, normalized: String(value) };
       return { ok: false, message: 'Nilai telepon tidak valid' };
     case 'TEXT':
       if (typeof value === 'string') return { ok: true, normalized: value };
-      if (typeof value === 'number' || typeof value === 'boolean') return { ok: true, normalized: String(value) };
+      if (typeof value === 'number' || typeof value === 'boolean')
+        return { ok: true, normalized: String(value) };
       return { ok: false, message: 'Nilai teks tidak valid' };
     case 'NUMBER':
-      if (typeof value === 'number' && Number.isFinite(value)) return { ok: true, normalized: value };
+      if (typeof value === 'number' && Number.isFinite(value))
+        return { ok: true, normalized: value };
       if (typeof value === 'string' && value.trim() !== '') {
         const num = Number(value);
         if (Number.isFinite(num)) return { ok: true, normalized: num };
@@ -669,7 +770,9 @@ function normalizeCellValue(
     case 'DATE': {
       if (typeof value !== 'string') return { ok: false, message: 'Nilai tanggal tidak valid' };
       const d = new Date(value);
-      return isNaN(d.getTime()) ? { ok: false, message: 'Nilai tanggal tidak valid' } : { ok: true, normalized: value };
+      return isNaN(d.getTime())
+        ? { ok: false, message: 'Nilai tanggal tidak valid' }
+        : { ok: true, normalized: value };
     }
     case 'SELECT': {
       const opts = Array.isArray(options) ? options.filter((o) => typeof o === 'string') : [];
@@ -712,7 +815,9 @@ function normalizeCellValue(
       return { ok: false, message: 'Nilai waktu tidak valid' };
     }
     case 'CHECKBOX':
-      return typeof value === 'boolean' ? { ok: true, normalized: value } : { ok: false, message: 'Nilai centang tidak valid' };
+      return typeof value === 'boolean'
+        ? { ok: true, normalized: value }
+        : { ok: false, message: 'Nilai centang tidak valid' };
     default:
       return { ok: false, message: 'Tipe properti tidak dikenal' };
   }

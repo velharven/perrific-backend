@@ -5,11 +5,89 @@ import { sendError } from '../lib/errors';
 import { AVATAR_RE, avatarUrlField } from '../lib/avatar';
 import { assigneesInclude, columnSelect, createdBySelect, uniqIds, watchersInclude, withAssignees, withWatchers } from '../lib/taskAssignees';
 import { emitToTeamMembers, emitToUser } from '../lib/socket';
-import { can, ensureProjectMember, PERMISSIONS } from '../lib/permissions';
+import { can, createDefaultRoles, ensureProjectMember, PERMISSIONS } from '../lib/permissions';
 import type { PermissionKey } from '../lib/permissions';
 
 function isUniqueConflict(e: unknown) {
   return (e as { code?: string })?.code === 'P2002';
+}
+
+export async function getMyPersonalProject(req: Request, res: Response) {
+  if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
+
+  const personalTeamId = `personal-${req.userId}`;
+  let team = await prisma.team.findUnique({
+    where: { id: personalTeamId },
+    include: {
+      projects: {
+        include: {
+          columns: { orderBy: { order: 'asc' } },
+        },
+      },
+    },
+  });
+
+  if (!team || team.projects.length === 0) {
+    if (!team) {
+      team = await prisma.team.create({
+        data: {
+          id: personalTeamId,
+          name: 'Workspace Pribadi',
+          description: 'Ruang kerja proyek pribadi',
+          members: {
+            create: [{ userId: req.userId, role: 'ADMIN' }],
+          },
+          projects: {
+            create: {
+              name: 'Project Pribadi',
+              description: 'Papan kanban proyek pribadi',
+              columns: {
+                create: [
+                  { name: 'To Do', color: '#8A8F98', order: 0 },
+                  { name: 'In Progress', color: '#0090FF', order: 1 },
+                  { name: 'Done', color: '#46A758', order: 2 },
+                ],
+              },
+            },
+          },
+        },
+        include: {
+          projects: {
+            include: {
+              columns: { orderBy: { order: 'asc' } },
+            },
+          },
+        },
+      });
+    } else {
+      const proj = await prisma.project.create({
+        data: {
+          teamId: team.id,
+          name: 'Project Pribadi',
+          description: 'Papan kanban proyek pribadi',
+          columns: {
+            create: [
+              { name: 'To Do', color: '#8A8F98', order: 0 },
+              { name: 'In Progress', color: '#0090FF', order: 1 },
+              { name: 'Done', color: '#46A758', order: 2 },
+            ],
+          },
+        },
+        include: {
+          columns: { orderBy: { order: 'asc' } },
+        },
+      });
+      team.projects = [proj];
+    }
+
+    const proj = team.projects[0];
+    await createDefaultRoles(proj.id);
+    await ensureProjectMember(proj.id, req.userId);
+  }
+
+  const project = team.projects[0];
+  await ensureProjectMember(project.id, req.userId);
+  return res.json({ success: true, data: project });
 }
 
 export async function getProject(req: Request, res: Response) {
@@ -92,7 +170,16 @@ export async function listTasks(req: Request, res: Response) {
   const tasks = await prisma.task.findMany({
     where: { projectId: req.params.projectId },
     orderBy: [{ column: { order: 'asc' } }, { order: 'asc' }],
-    include: { ...assigneesInclude, ...watchersInclude, ...createdBySelect, ...columnSelect },
+    include: {
+      ...assigneesInclude,
+      ...watchersInclude,
+      ...createdBySelect,
+      ...columnSelect,
+      dailyActivities: {
+        where: req.userId ? { userId: req.userId } : undefined,
+        select: { id: true, date: true, startTime: true, endTime: true, allDay: true, calendarConnectionId: true, googleEventId: true },
+      },
+    },
   });
   return res.json({ success: true, data: tasks.map((t) => withWatchers(withAssignees(t))) });
 }

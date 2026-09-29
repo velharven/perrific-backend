@@ -104,6 +104,9 @@ model User {
   dailyActivities DailyActivity[]
   dailyColumns DailyColumn[]
   calendarLayoutPreferences CalendarLayoutPreference[]
+  calendarSyncStates CalendarSyncState[]
+  googleCalendarConnectionId String?
+  googleCalendarConnections GoogleCalendarConnection[]
   notifications  Notification[]
   comments       Comment[]
   notes          Note[]
@@ -312,6 +315,7 @@ model DailyActivity {
   date       DateTime
   startTime  DateTime?
   endTime    DateTime?
+  allDay     Boolean        @default(false)
   type       ActivityType   @default(CUSTOM)
   status     ActivityStatus @default(PENDING)
   icon       String?        // emoji Notion-style (mis. "📝", "🎯")
@@ -319,6 +323,8 @@ model DailyActivity {
   customValues Json?        // peta columnId -> nilai properti kustom (DailyColumn)
   recurrence Json?          // aturan pengulangan kegiatan (freq, interval, byDays, byMonthDay, byWeekOfMonth, endType, untilDate, count)
   googleEventId String?     // ID event pada Google Calendar
+  calendarConnectionId String?
+  calendarConnection GoogleCalendarConnection? @relation(fields: [calendarConnectionId], references: [id], onDelete: Restrict)
   color      String?        // ID warna Google Calendar ('1'..'11') atau custom hex
   createdAt  DateTime       @default(now())
   updatedAt  DateTime       @updatedAt
@@ -329,7 +335,47 @@ model DailyActivity {
 
   @@index([userId])
   @@index([date])
+  @@index([userId, calendarConnectionId, googleEventId])
   @@map("daily_activities")
+}
+
+// No activity FK: a deletion must remain retryable after the local row is gone.
+model CalendarSyncState {
+  id             String   @id @default(uuid())
+  userId         String
+  activityId     String
+  googleEventId  String?
+  calendarConnectionId String?
+  recurringEventId String?
+  calendarConnection GoogleCalendarConnection? @relation(fields: [calendarConnectionId], references: [id], onDelete: Restrict)
+  snapshot       Json?
+  localChanges   Json?
+  googleEtag     String?
+  pending        Boolean  @default(false)
+  pendingDelete  Boolean  @default(false)
+  lastError      String?
+  updatedAt      DateTime @updatedAt
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, activityId])
+  @@index([userId, googleEventId])
+  @@index([calendarConnectionId, googleEventId])
+  @@map("calendar_sync_states")
+}
+
+model GoogleCalendarConnection {
+  id String @id @default(uuid())
+  userId String
+  googleSubject String
+  calendarId String @default("primary")
+  email String?
+  syncToken String?
+  syncedAt DateTime?
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  activities DailyActivity[]
+  syncStates CalendarSyncState[]
+  @@unique([userId, googleSubject, calendarId])
+  @@map("google_calendar_connections")
 }
 
 // Preferensi posisi kolom kalender per pengguna dan tanggal.

@@ -32,7 +32,10 @@ function isUniqueConflict(e: unknown) {
 
 export async function listMyTeams(req: Request, res: Response) {
   const teams = await prisma.team.findMany({
-    where: { members: { some: { userId: req.userId } } },
+    where: {
+      members: { some: { userId: req.userId } },
+      NOT: { id: { startsWith: 'personal-' } },
+    },
     include: {
       members: {
         include: { user: { select: { id: true, name: true, email: true, avatarUrl: true } } },
