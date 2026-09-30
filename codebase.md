@@ -189,7 +189,7 @@ Semua rute diawali dengan prefix `/api`.
 - `GET /google/events`: Mengambil daftar event kalender Google pengguna dalam rentang waktu tertentu.
 - `POST /google/sync-activity/:activityId`: Memicu sinkronisasi instan satu kegiatan harian spesifik ke Google Calendar.
 - `POST /google/import`: Mengimpor event Google Calendar menjadi entri DailyActivity lokal.
-- `POST /google/auto-sync`: Memicu sinkronisasi dua arah otomatis antara DailyActivity dan Google Calendar.
+- `POST /google/auto-sync`: Memicu sinkronisasi dua arah otomatis antara DailyActivity dan Google Calendar. Menerima `startDate`, `endDate`, dan `hydrateRange?: boolean` (default `false`); `hydrateRange: true` mengimpor rentang tampilan walaupun `syncToken` sudah tersedia. Permintaan rentang berbeda pada koneksi yang sama diantrekan.
 - `PATCH /google/events/:eventId`: Memperbarui data event kalender Google (judul, waktu mulai, selesai, deskripsi).
 - `DELETE /google/events/:eventId`: Menghapus event pada Google Calendar dan melepaskan tautan Google event pada DailyActivity lokal.
 - Logika sinkronisasi otomatis: Pembuatan, pembaruan, dan penghapusan `DailyActivity` secara otomatis menyelaraskan event Google Calendar terkait di latar belakang serta menyiarkan event real-time `calendar:synced` (`create`, `update`, `delete`).

@@ -368,6 +368,7 @@ export async function syncActivity(req: Request, res: Response) {
 const syncRangeSchema = z.object({
   startDate: z.string().optional(),
   endDate: z.string().optional(),
+  hydrateRange: z.boolean().optional().default(false),
 });
 export async function handleAutoSync(req: Request, res: Response) {
   if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
@@ -375,7 +376,9 @@ export async function handleAutoSync(req: Request, res: Response) {
   try {
     return res.json({
       success: true,
-      data: await autoSyncTwoWay(req.userId, body.startDate, body.endDate, expectedConnection(req)),
+      data: await autoSyncTwoWay(req.userId, body.startDate, body.endDate, expectedConnection(req), {
+        hydrateRange: body.hydrateRange,
+      }),
     });
   } catch (error) {
     return syncFailure(res, error);

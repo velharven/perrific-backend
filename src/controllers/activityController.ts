@@ -138,6 +138,7 @@ export async function listMyActivities(req: Request, res: Response) {
     take,
   });
 
+  await assertConnection(req.userId, connectionId);
   return res.json({ success: true, data: activities, connectionId });
 }
 

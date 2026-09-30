@@ -8,7 +8,6 @@ export { CalendarSyncError } from './calendarConnection';
 import {
   buildGoogleRecurrenceRule,
   getValidUserToken,
-  listGoogleEventItems,
   refreshGoogleAccessToken,
   type GoogleCalendarEventItem,
 } from './googleCalendarClient';
@@ -198,6 +197,7 @@ function recurrenceConfig(rules: string[] | null): Prisma.InputJsonValue | typeo
     endType: 'NEVER',
   };
   const days = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
+  if (parts.WKST) result.weekStartsOn = days.indexOf(parts.WKST);
   if (parts.BYDAY) {
     const monthly = /^(-?\d)(SU|MO|TU|WE|TH|FR|SA)$/.exec(parts.BYDAY);
     if (monthly)
@@ -216,6 +216,31 @@ function recurrenceConfig(rules: string[] | null): Prisma.InputJsonValue | typeo
     result.untilDate = `${parts.UNTIL.slice(0, 4)}-${parts.UNTIL.slice(4, 6)}-${parts.UNTIL.slice(6, 8)}`;
   }
   return json(result);
+}
+
+export function recurrenceDisplayConfig(rules: string[] | null): Prisma.InputJsonValue | null {
+  const recurrenceRules = rules?.filter(rule => rule.startsWith('RRULE:')) || [];
+  if (recurrenceRules.length !== 1 || rules?.some(rule => !/^(RRULE:|EXDATE[;:])/.test(rule))) return null;
+  const entries = recurrenceRules[0].slice(6).split(';').map(part => part.split('='));
+  const supported = new Set(['FREQ', 'INTERVAL', 'COUNT', 'UNTIL', 'BYDAY', 'BYMONTHDAY', 'WKST']);
+  if (entries.some(([key, value]) => !supported.has(key) || !value)) return null;
+  const parts: Record<string, string> = Object.fromEntries(entries);
+  if (Object.keys(parts).length !== entries.length) return null;
+  for (const key of ['INTERVAL', 'COUNT']) {
+    if (parts[key] && (!Number.isInteger(Number(parts[key])) || Number(parts[key]) < 1)) return null;
+  }
+  if (parts.COUNT && parts.UNTIL) return null;
+  if (parts.WKST && !/^(SU|MO|TU|WE|TH|FR|SA)$/.test(parts.WKST)) return null;
+  if (parts.UNTIL && !/^\d{8}(T\d{6}Z)?$/.test(parts.UNTIL)) return null;
+  if (parts.BYDAY) {
+    const weekly = parts.FREQ === 'WEEKLY' && /^(SU|MO|TU|WE|TH|FR|SA)(,(SU|MO|TU|WE|TH|FR|SA))*$/.test(parts.BYDAY);
+    const monthly = parts.FREQ === 'MONTHLY' && /^(-1|[1-5])(SU|MO|TU|WE|TH|FR|SA)$/.test(parts.BYDAY);
+    if (!weekly && !monthly) return null;
+  }
+  if (parts.BYMONTHDAY && (parts.FREQ !== 'MONTHLY' || parts.BYDAY ||
+    !Number.isInteger(Number(parts.BYMONTHDAY)) || Number(parts.BYMONTHDAY) < 1 || Number(parts.BYMONTHDAY) > 31)) return null;
+  const parsed = recurrenceConfig(rules);
+  return parsed === Prisma.DbNull ? null : parsed as Prisma.InputJsonValue;
 }
 
 export async function ensureCalendarStateLocked(activity: ActivityWithChecklist, mutation = false) {
@@ -383,8 +408,8 @@ export async function notifyCalendarChangedLocked(
   });
   const activity =
     typeof payload.activityId === 'string'
-      ? await prisma.dailyActivity.findUnique({
-          where: { id: payload.activityId },
+      ? await prisma.dailyActivity.findFirst({
+          where: { id: payload.activityId, userId },
           include: { checklistItems: { orderBy: { order: 'asc' } } },
         })
       : null;
@@ -780,7 +805,12 @@ type SyncResult = {
   syncedAt: string | null;
   baselinePending?: boolean;
 };
-const syncFlights = new Map<string, Promise<SyncResult>>();
+interface SyncFlight {
+  rangeKey: string;
+  hydrateRange: boolean;
+  promise: Promise<SyncResult>;
+}
+const syncFlights = new Map<string, SyncFlight>();
 const baselines = new Map<string, Promise<void>>();
 
 function emptyResult(connectionId: string): SyncResult {
@@ -885,7 +915,7 @@ async function applyEventPage(
       if (
         tombstones.has(event.id) ||
         (event.recurringEventId && tombstones.has(event.recurringEventId)) ||
-        (isMasterInstance && !activity && !event.originalStartTime)
+        (isMasterInstance && !activity)
       )
         continue;
       if (activity) {
@@ -1080,6 +1110,36 @@ async function fetchCanonical(
   });
 }
 
+async function hydrateVisibleRange(
+  userId: string,
+  connectionId: string,
+  window: { start: Date; end: Date },
+  result: SyncResult,
+) {
+  const params = new URLSearchParams({
+    timeMin: window.start.toISOString(),
+    timeMax: window.end.toISOString(),
+    singleEvents: 'true',
+    showDeleted: 'true',
+    orderBy: 'startTime',
+    maxResults: '2500',
+  });
+  let pageToken: string | undefined;
+  do {
+    if (pageToken) params.set('pageToken', pageToken);
+    const response = await calendarRequest(userId, `?${params}`, {}, connectionId);
+    if (!response.ok)
+      throw new CalendarSyncError(502, 'Rentang Google Calendar belum dapat dibaca.');
+    const page = (await response.json()) as {
+      items?: GoogleCalendarEventItem[];
+      nextPageToken?: string;
+    };
+    // Google filters by overlap, so an event may begin before the displayed range.
+    await applyEventPage(userId, connectionId, page.items || [], result);
+    pageToken = page.nextPageToken;
+  } while (pageToken);
+}
+
 async function finishSync(userId: string, result: SyncResult) {
   await withUserCalendarLock(userId, async () => {
     await assertConnection(userId, result.connectionId);
@@ -1114,12 +1174,11 @@ export async function autoSyncTwoWay(
   from?: string,
   to?: string,
   expected?: string | null,
+  options: { hydrateRange?: boolean } = {},
 ): Promise<SyncResult> {
   const token = await getValidUserToken(userId, expected);
   if ('error' in token) throw new CalendarSyncError(token.code, token.error);
   const connectionId = token.connectionId;
-  const current = syncFlights.get(connectionId);
-  if (current) return current;
   const today = calendarDate(new Date());
   const year = Number(today.slice(0, 4)),
     month = Number(today.slice(5, 7)) - 1;
@@ -1133,24 +1192,28 @@ export async function autoSyncTwoWay(
     window.start >= window.end
   )
     throw new CalendarSyncError(422, 'Rentang kalender tidak valid.');
+  const rangeKey = `${window.start.toISOString()}/${window.end.toISOString()}`;
+  const hydrateRange = options.hydrateRange ?? false;
+  const current = syncFlights.get(connectionId);
+  if (current?.rangeKey === rangeKey && (!hydrateRange || current.hydrateRange))
+    return current.promise;
   const run = (async () => {
+    // Preserve requests for other ranges; an overlapping caller must not receive
+    // success for dates that were never imported. A failed predecessor does not
+    // prevent the next range from being attempted.
+    if (current) await current.promise.catch(() => undefined);
+    await assertConnection(userId, connectionId);
     const result = emptyResult(connectionId);
     await drainPending(userId, connectionId, result);
     const connection = await prisma.googleCalendarConnection.findUniqueOrThrow({
       where: { id: connectionId },
     });
+    if (hydrateRange || !connection.syncToken)
+      await hydrateVisibleRange(userId, connectionId, window, result);
     if (connection.syncToken)
       await fetchCanonical(userId, connectionId, connection.syncToken, result, window);
     else {
       // Fetch the visible dates first, then build the unbounded canonical cursor in the background.
-      const events = await listGoogleEventItems(
-        token.accessToken,
-        window.start.toISOString(),
-        window.end.toISOString(),
-        2500,
-      );
-      await assertConnection(userId, connectionId);
-      await applyEventPage(userId, connectionId, events, result, window);
       result.baselinePending = true;
       if (!baselines.has(connectionId)) {
         const background = (async () => {
@@ -1176,11 +1239,12 @@ export async function autoSyncTwoWay(
     await finishSync(userId, result);
     return result;
   })();
-  syncFlights.set(connectionId, run);
+  const flight = { rangeKey, hydrateRange, promise: run };
+  syncFlights.set(connectionId, flight);
   try {
     return await run;
   } finally {
-    if (syncFlights.get(connectionId) === run) syncFlights.delete(connectionId);
+    if (syncFlights.get(connectionId) === flight) syncFlights.delete(connectionId);
   }
 }
 

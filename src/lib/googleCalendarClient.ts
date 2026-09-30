@@ -13,9 +13,9 @@ export interface GoogleCalendarEventItem {
   status?: string;
   recurrence?: string[];
   recurringEventId?: string;
-  originalStartTime?: { dateTime?: string; date?: string };
-  start?: { dateTime?: string; date?: string };
-  end?: { dateTime?: string; date?: string };
+  originalStartTime?: { dateTime?: string; date?: string; timeZone?: string };
+  start?: { dateTime?: string; date?: string; timeZone?: string };
+  end?: { dateTime?: string; date?: string; timeZone?: string };
   colorId?: string;
 }
 
@@ -267,6 +267,7 @@ interface RecurrenceRuleConfig {
   freq: 'DAILY' | 'WEEKLY' | 'MONTHLY' | 'YEARLY';
   interval?: number;
   byDays?: number[];
+  weekStartsOn?: number;
   byMonthDay?: number;
   byWeekOfMonth?: {
     week: number;
@@ -328,6 +329,8 @@ export function buildGoogleRecurrenceRule(raw: unknown): string[] | null {
   }
 
   const rules: string[] = [`RRULE:${parts.join(';')}`];
+  if (Number.isInteger(rec.weekStartsOn) && rec.weekStartsOn! >= 0 && rec.weekStartsOn! <= 6)
+    rules[0] += `;WKST=${RRULE_DAYS[rec.weekStartsOn!]}`;
   if (Array.isArray(rec.excludeDates) && rec.excludeDates.length > 0) {
     const validExdates = rec.excludeDates
       .map((d) => d.trim().replace(/-/g, '').slice(0, 8))

@@ -12,10 +12,11 @@ import {
   syncActivityLocked,
   calendarRequest,
   waitForCalendarBaseline,
+  recurrenceDisplayConfig,
 } from './googleCalendarSync';
 import type { GoogleCalendarEventItem } from './googleCalendarClient';
 import type { Request, Response as ExpressResponse } from 'express';
-import { connect } from '../controllers/googleCalendarController';
+import { connect, handleAutoSync } from '../controllers/googleCalendarController';
 import {
   listMyActivities,
   updateActivity,
@@ -290,6 +291,162 @@ test('unknown legacy links are kept and never sent through a newly connected acc
   assert.ok(await h.activity());
   assert.equal((await h.state()).calendarConnectionId, null);
 });
+
+test('opening November imports an unchanged event missed by the October baseline', async () => {
+  const h = await harness();
+  await prisma.googleCalendarConnection.update({ where: { id: h.connectionId }, data: { syncToken: null } });
+  const november = { ...h.remote, id: 'november-event', summary: 'November event',
+    start: { dateTime: '2026-11-12T07:00:00Z' }, end: { dateTime: '2026-11-12T08:00:00Z' } };
+  mock.method(globalThis, 'fetch', async (url: unknown) => {
+    const p = new URL(String(url)).searchParams;
+    if (p.has('timeMin')) return response({ items: p.get('timeMin')!.startsWith('2026-11') ? [november] : [] });
+    if (p.has('syncToken')) {
+      assert.equal(p.has('timeMin'), false);
+      assert.equal(p.has('orderBy'), false);
+      return response({ items: [], nextSyncToken: 'next-cursor' });
+    }
+    return response({ items: [h.remote, november], nextSyncToken: 'baseline-cursor' });
+  });
+  await autoSyncTwoWay(h.userId, '2026-10-01', '2026-11-01', h.connectionId, { hydrateRange: true });
+  await waitForCalendarBaseline(h.connectionId);
+  assert.equal(await prisma.dailyActivity.count({ where: { userId: h.userId, googleEventId: november.id } }), 0);
+  const imported = await autoSyncTwoWay(h.userId, '2026-11-01', '2026-12-01', h.connectionId, { hydrateRange: true });
+  assert.equal(imported.importedCount, 1);
+  const stored = await prisma.dailyActivity.findFirstOrThrow({ where: { userId: h.userId, googleEventId: november.id } });
+  assert.equal(stored.type, 'CUSTOM');
+  assert.equal(stored.calendarConnectionId, h.connectionId);
+  await autoSyncTwoWay(h.userId, '2026-11-01', '2026-12-01', h.connectionId, { hydrateRange: true });
+  assert.equal(await prisma.dailyActivity.count({ where: { userId: h.userId, googleEventId: november.id } }), 1);
+});
+
+test('concurrent range requests are serialized and identical queued ranges share a result', async () => {
+  const h = await harness();
+  let release!: () => void;
+  let started!: () => void;
+  const ready = new Promise<void>(resolve => { started = resolve; });
+  const ranges: string[] = [];
+  mock.method(globalThis, 'fetch', async (url: unknown) => {
+    const p = new URL(String(url)).searchParams;
+    if (p.has('timeMin')) {
+      const start = p.get('timeMin')!;
+      ranges.push(start);
+      if (start.startsWith('2026-10')) {
+        started();
+        await new Promise<void>(resolve => { release = resolve; });
+      }
+      return response({ items: [{ ...h.remote, id: start, start: { dateTime: start }, end: { dateTime: new Date(new Date(start).getTime() + 3600000).toISOString() } }] });
+    }
+    return response({ items: [], nextSyncToken: 'next-cursor' });
+  });
+  const october = autoSyncTwoWay(h.userId, '2026-10-01', '2026-11-01', h.connectionId, { hydrateRange: true });
+  await ready;
+  const november = autoSyncTwoWay(h.userId, '2026-11-01', '2026-12-01', h.connectionId, { hydrateRange: true });
+  const duplicate = autoSyncTwoWay(h.userId, '2026-11-01', '2026-12-01', h.connectionId, { hydrateRange: true });
+  const done = Promise.all([october, november, duplicate]);
+  assert.equal(ranges.length, 1);
+  release();
+  const [first, second, shared] = await done;
+  assert.deepEqual(ranges, ['2026-10-01T00:00:00.000Z', '2026-11-01T00:00:00.000Z']);
+  assert.notEqual(first.syncRunId, second.syncRunId);
+  assert.equal(second.syncRunId, shared.syncRunId);
+  assert.equal(first.importedCount, 1);
+  assert.equal(second.importedCount, 1);
+});
+
+test('range pagination retries safely and cannot advance the canonical cursor after a failed page', async () => {
+  const h = await harness();
+  let failPage = true;
+  const event = { ...h.remote, id: 'range-event', start: { dateTime: '2026-11-10T07:00:00Z' }, end: { dateTime: '2026-11-10T08:00:00Z' } };
+  mock.method(globalThis, 'fetch', async (url: unknown) => {
+    const p = new URL(String(url)).searchParams;
+    if (!p.has('timeMin')) return response({ items: [], nextSyncToken: 'next-cursor' });
+    assert.equal(p.has('syncToken'), false);
+    assert.equal(p.get('singleEvents'), 'true');
+    if (p.get('pageToken') === 'last-page') {
+      if (failPage) throw new Error('offline');
+      return response({ items: [] });
+    }
+    return response({ items: [event], nextPageToken: 'last-page' });
+  });
+  await assert.rejects(autoSyncTwoWay(h.userId, '2026-11-01', '2026-12-01', h.connectionId, { hydrateRange: true }));
+  assert.equal((await prisma.googleCalendarConnection.findUniqueOrThrow({ where: { id: h.connectionId } })).syncToken, 'cursor-old');
+  failPage = false;
+  await autoSyncTwoWay(h.userId, '2026-11-01', '2026-12-01', h.connectionId, { hydrateRange: true });
+  assert.equal(await prisma.dailyActivity.count({ where: { userId: h.userId, googleEventId: event.id } }), 1);
+  assert.equal((await prisma.googleCalendarConnection.findUniqueOrThrow({ where: { id: h.connectionId } })).syncToken, 'next-cursor');
+});
+
+test('range import preserves all-day dates, overlapping events, recurring identity and midnight in WIB', async () => {
+  const h = await harness();
+  const events: GoogleCalendarEventItem[] = [
+    { ...h.remote, id: 'midnight', start: { dateTime: '2026-10-31T18:00:00Z' }, end: { dateTime: '2026-10-31T19:00:00Z' } },
+    { ...h.remote, id: 'all-day', start: { date: '2026-11-01' }, end: { date: '2026-11-03' } },
+    { ...h.remote, id: 'overlap', start: { date: '2026-10-31' }, end: { date: '2026-11-02' } },
+    { ...h.remote, id: 'series_20261101', recurringEventId: 'series', originalStartTime: { dateTime: '2026-11-01T07:00:00Z' }, start: { dateTime: '2026-11-01T07:00:00Z' }, end: { dateTime: '2026-11-01T08:00:00Z' } },
+  ];
+  mock.method(globalThis, 'fetch', async (url: unknown) => new URL(String(url)).searchParams.has('timeMin')
+    ? response({ items: events }) : response({ items: [], nextSyncToken: 'next-cursor' }));
+  const r = controllerResponse();
+  const req = request(h.userId, h.connectionId, {
+    startDate: '2026-10-31T17:00:00Z', endDate: '2026-11-30T17:00:00Z', hydrateRange: true,
+  });
+  await handleAutoSync(req, r.res);
+  assert.equal(r.data().importedCount, 4);
+  await handleAutoSync(req, r.res);
+  assert.equal(r.data().importedCount, 0);
+  const stored = await prisma.dailyActivity.findMany({ where: { userId: h.userId, googleEventId: { in: events.map(event => event.id) } } });
+  assert.equal(stored.length, 4);
+  assert.equal(stored.find(activity => activity.googleEventId === 'midnight')!.date.toISOString(), '2026-11-01T00:00:00.000Z');
+  assert.equal(stored.find(activity => activity.googleEventId === 'all-day')!.allDay, true);
+  assert.equal(stored.find(activity => activity.googleEventId === 'all-day')!.startTime, null);
+  const instance = stored.find(activity => activity.googleEventId === 'series_20261101')!;
+  const state = await prisma.calendarSyncState.findUniqueOrThrow({ where: { userId_activityId: { userId: h.userId, activityId: instance.id } } });
+  assert.equal(state.recurringEventId, 'series');
+  assert.equal(stored.every(activity => activity.type === 'CUSTOM' && activity.calendarConnectionId === h.connectionId), true);
+});
+
+test('range reimport updates the same link and a tombstone blocks a stale range response', async () => {
+  const h = await harness();
+  const changed = { ...h.remote, summary: 'Google title', description: 'Google description', etag: 'new-etag', updated: '2026-11-05T03:00:00Z', start: { dateTime: '2026-11-05T07:00:00Z' }, end: { dateTime: '2026-11-05T08:00:00Z' } };
+  let deleted = false;
+  mock.method(globalThis, 'fetch', async (url: unknown) => new URL(String(url)).searchParams.has('timeMin')
+    ? response({ items: [changed] })
+    : response({ items: deleted ? [{ id: changed.id, status: 'cancelled' }] : [], nextSyncToken: 'next-cursor' }));
+  const sync = () => autoSyncTwoWay(h.userId, '2026-11-01', '2026-12-01', h.connectionId, { hydrateRange: true });
+  assert.equal((await sync()).updatedCount, 1);
+  assert.equal((await h.activity())!.title, 'Google title');
+  assert.equal((await h.activity())!.description, 'Google description');
+  assert.equal((await h.activity())!.startTime!.toISOString(), changed.start.dateTime.replace('Z', '.000Z'));
+  deleted = true;
+  assert.equal((await sync()).deletedCount, 1);
+  assert.equal(await h.activity(), null);
+  assert.equal((await sync()).importedCount, 0);
+  assert.equal(await h.activity(), null);
+});
+
+test('switching accounts rejects the running range and its queued successor', async () => {
+  const h = await harness();
+  const b = await prisma.googleCalendarConnection.create({ data: { userId: h.userId, googleSubject: 'subject-b' } });
+  let finish!: (value: globalThis.Response) => void;
+  let started!: () => void;
+  const ready = new Promise<void>(resolve => { started = resolve; });
+  const fetch = mock.method(globalThis, 'fetch', async () => {
+    started();
+    return new Promise<globalThis.Response>(resolve => { finish = resolve; });
+  });
+  const first = autoSyncTwoWay(h.userId, '2026-10-01', '2026-11-01', h.connectionId, { hydrateRange: true });
+  await ready;
+  const second = autoSyncTwoWay(h.userId, '2026-11-01', '2026-12-01', h.connectionId, { hydrateRange: true });
+  const done = Promise.allSettled([first, second]);
+  await prisma.user.update({ where: { id: h.userId }, data: { googleCalendarConnectionId: b.id, googleCalendarAccessToken: 'token-b' } });
+  finish(response({ items: [{ ...h.remote, id: 'stale-event' }] }));
+  for (const result of await done) {
+    assert.equal(result.status, 'rejected');
+    if (result.status === 'rejected') assert.equal(result.reason.code, 409);
+  }
+  assert.equal(fetch.mock.callCount(), 1);
+  assert.equal(await prisma.dailyActivity.count({ where: { userId: h.userId, googleEventId: 'stale-event' } }), 0);
+});
 after(async () => {
   await prisma.$disconnect();
 });
@@ -372,6 +529,61 @@ async function harness(linked = true) {
 
 const response = (event: unknown, status = 200) =>
   new Response(JSON.stringify(event), { status, headers: { 'Content-Type': 'application/json' } });
+
+test('unsupported Google recurrence patterns fall back without inventing a different schedule label', () => {
+  for (const rule of [
+    'RRULE:FREQ=MONTHLY;BYDAY=TU;BYSETPOS=1',
+    'RRULE:FREQ=MONTHLY;BYMONTHDAY=1,15',
+    'RRULE:FREQ=MONTHLY;BYDAY=TU,TH',
+    'RRULE:FREQ=YEARLY;BYMONTH=2',
+    'RRULE:FREQ=WEEKLY;BYDAY=BAD',
+  ]) assert.equal(recurrenceDisplayConfig([rule]), null);
+  assert.equal(recurrenceDisplayConfig(['RRULE:FREQ=DAILY', 'RDATE:20261001']), null);
+  assert.equal(recurrenceDisplayConfig(['RRULE:FREQ=DAILY', 'RRULE:FREQ=WEEKLY']), null);
+  assert.deepEqual(recurrenceDisplayConfig(['RRULE:FREQ=WEEKLY;BYDAY=TU', 'EXDATE:20261006']), {
+    freq: 'WEEKLY', interval: 1, byDays: [2], endType: 'NEVER',
+  });
+});
+
+test('expanded instances of an existing recurring master activity are not imported as duplicates during range hydration', async () => {
+  const h = await harness();
+  await prisma.dailyActivity.update({
+    where: { id: h.id },
+    data: {
+      recurrence: { freq: 'WEEKLY', interval: 1, byDays: [2], endType: 'NEVER' },
+    },
+  });
+  const expandedInstances: GoogleCalendarEventItem[] = [
+    {
+      ...h.remote,
+      id: `${h.remote.id}_20261006T070000Z`,
+      recurringEventId: h.remote.id,
+      originalStartTime: { dateTime: '2026-10-06T07:00:00Z' },
+      start: { dateTime: '2026-10-06T07:00:00Z' },
+      end: { dateTime: '2026-10-06T08:00:00Z' },
+    },
+    {
+      ...h.remote,
+      id: `${h.remote.id}_20261013T070000Z`,
+      recurringEventId: h.remote.id,
+      originalStartTime: { dateTime: '2026-10-13T07:00:00Z' },
+      start: { dateTime: '2026-10-13T07:00:00Z' },
+      end: { dateTime: '2026-10-13T08:00:00Z' },
+    },
+  ];
+  mock.method(globalThis, 'fetch', async (url: unknown) =>
+    new URL(String(url)).searchParams.has('timeMin')
+      ? response({ items: expandedInstances })
+      : response({ items: [], nextSyncToken: 'next-cursor' }),
+  );
+  const result = await autoSyncTwoWay(h.userId, '2026-10-01', '2026-11-01', h.connectionId, {
+    hydrateRange: true,
+  });
+  assert.equal(result.importedCount, 0);
+  const allActivities = await prisma.dailyActivity.findMany({ where: { userId: h.userId } });
+  assert.equal(allActivities.length, 1);
+  assert.equal(allActivities[0].id, h.id);
+});
 
 test('failed outbound edit remains pending and retries without overwriting the local description', async () => {
   const h = await harness();
