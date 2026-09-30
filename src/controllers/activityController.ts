@@ -144,7 +144,7 @@ export async function listMyActivities(req: Request, res: Response) {
 
 const recurrenceSchema = z
   .object({
-    freq: z.enum(['DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY']),
+    freq: z.enum(['DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY']).optional(),
     interval: z.number().int().min(1).default(1),
     byDays: z.array(z.number().int().min(0).max(6)).optional(),
     byMonthDay: z.number().int().min(1).max(31).optional(),
@@ -158,6 +158,8 @@ const recurrenceSchema = z
     untilDate: z.string().nullable().optional(),
     count: z.number().int().min(1).nullable().optional(),
     excludeDates: z.array(z.string()).optional(),
+    isException: z.boolean().optional(),
+    masterActivityId: z.string().optional(),
   })
   .nullable()
   .optional();
@@ -323,11 +325,22 @@ export async function updateActivity(req: Request, res: Response) {
     if (body.order !== undefined) data.order = body.order;
     if (body.type !== undefined) data.type = body.type;
     if (body.color !== undefined) data.color = body.color;
+    const oldRec = (existing.recurrence as Record<string, unknown> | null) || {};
+    const newRec = (body.recurrence as Record<string, unknown> | null) || {};
+    const oldExdates = Array.isArray(oldRec.excludeDates) ? (oldRec.excludeDates as string[]) : [];
+    const newExdates = Array.isArray(newRec.excludeDates) ? (newRec.excludeDates as string[]) : [];
+    const unexcludedDates = oldExdates.filter((d) => !newExdates.includes(d));
+
     if (body.recurrence !== undefined) {
-      data.recurrence =
-        body.recurrence === null
-          ? Prisma.DbNull
-          : (body.recurrence as unknown as Prisma.InputJsonValue);
+      if (body.recurrence === null) {
+        data.recurrence = Prisma.DbNull;
+      } else {
+        const mergedRec = {
+          ...((existing.recurrence as Record<string, unknown> | null) || {}),
+          ...body.recurrence,
+        };
+        data.recurrence = mergedRec as unknown as Prisma.InputJsonValue;
+      }
     }
     if (body.date !== undefined) {
       const d = parseOptionalDate(body.date);
@@ -352,7 +365,9 @@ export async function updateActivity(req: Request, res: Response) {
     });
 
     await propagatePersonalActivityLocked(activity, fields);
-    if (fields.length && !unscheduling) await syncActivityLocked(userId, activity.id);
+    if (fields.length && !unscheduling) {
+      await syncActivityLocked(userId, activity.id, undefined, unexcludedDates);
+    }
     const calendarMeta = await notifyCalendarChangedLocked(userId, {
       action: 'update',
       activityId: activity.id,

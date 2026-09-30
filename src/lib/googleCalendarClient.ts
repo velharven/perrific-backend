@@ -69,6 +69,7 @@ export async function findRecurringInstanceForActivity(
   parentId: string,
   date: Date,
   startTime: Date | null,
+  dateStr?: string,
 ): Promise<GoogleCalendarEventItem | null> {
   const reference = startTime ?? date;
   const url = new URL(
@@ -94,7 +95,20 @@ export async function findRecurringInstanceForActivity(
     pageToken = page.nextPageToken;
   } while (pageToken);
 
-  const maxDifference = startTime ? 60000 : 12 * 3600000;
+  if (dateStr) {
+    const matched = instances.find((item) => {
+      const startVal =
+        item.start?.dateTime ||
+        item.start?.date ||
+        item.originalStartTime?.dateTime ||
+        item.originalStartTime?.date ||
+        '';
+      return startVal.startsWith(dateStr);
+    });
+    if (matched) return matched;
+  }
+
+  const maxDifference = startTime ? 4 * 3600000 : 12 * 3600000;
   return (
     instances
       .map((item) => ({
@@ -283,7 +297,8 @@ const RRULE_DAYS = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'] as const;
 
 export function buildGoogleRecurrenceRule(raw: unknown): string[] | null {
   if (!raw || typeof raw !== 'object') return null;
-  const rec = raw as RecurrenceRuleConfig;
+  const rec = raw as RecurrenceRuleConfig & { isException?: boolean };
+  if (rec.isException) return null;
   if (!rec.freq || !['DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY'].includes(rec.freq)) {
     return null;
   }

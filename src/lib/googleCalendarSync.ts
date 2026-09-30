@@ -9,6 +9,7 @@ import {
   buildGoogleRecurrenceRule,
   getValidUserToken,
   refreshGoogleAccessToken,
+  findRecurringInstanceForActivity,
   type GoogleCalendarEventItem,
 } from './googleCalendarClient';
 import {
@@ -429,6 +430,18 @@ async function applyCalendarValuesLocked(
   );
   if (!fields.length && activity.googleEventId === eventId) return false;
   const timed = values.start.includes('T');
+  const existingRec = activity.recurrence as Record<string, unknown> | null;
+  let nextRec: Prisma.InputJsonValue | typeof Prisma.DbNull = recurrenceConfig(values.recurrence);
+  if (existingRec?.isException) {
+    nextRec = existingRec as unknown as Prisma.InputJsonValue;
+  } else if (
+    nextRec &&
+    nextRec !== Prisma.DbNull &&
+    typeof nextRec === 'object' &&
+    Array.isArray(existingRec?.excludeDates)
+  ) {
+    (nextRec as Record<string, unknown>).excludeDates = existingRec.excludeDates;
+  }
   const updated = await prisma.dailyActivity.update({
     where: { id: activity.id },
     data: {
@@ -439,7 +452,7 @@ async function applyCalendarValuesLocked(
       endTime: timed ? new Date(values.end) : null,
       allDay: !timed,
       color: values.color,
-      recurrence: recurrenceConfig(values.recurrence),
+      recurrence: nextRec,
       googleEventId: eventId,
     },
   });
@@ -550,6 +563,7 @@ export async function syncActivityLocked(
   userId: string,
   activityId: string,
   suppliedRemote?: GoogleCalendarEventItem | null,
+  unexcludedDates?: string[],
 ): Promise<SyncOneResult> {
   const result: SyncOneResult = {
     googleEventId: null,
@@ -677,6 +691,7 @@ export async function syncActivityLocked(
         activity.googleEventId === id
       ) {
         result.googleEventId = id;
+        await syncRecurrenceExceptionsLocked(userId, activity, id, unexcludedDates);
         return result;
       }
       result.updated = await applyCalendarValuesLocked(activity, merged, id, remote.updated);
@@ -693,6 +708,7 @@ export async function syncActivityLocked(
         },
       });
       result.googleEventId = id;
+      await syncRecurrenceExceptionsLocked(userId, activity, id, unexcludedDates);
       return result;
     }
   } catch (error) {
@@ -706,6 +722,116 @@ export async function syncActivityLocked(
     });
   }
   return result;
+}
+
+export async function syncRecurrenceExceptionsLocked(
+  userId: string,
+  activity: DailyActivity,
+  googleEventId?: string | null,
+  unexcludedDates?: string[],
+) {
+  const eventId = googleEventId || activity.googleEventId;
+  if (!eventId) return;
+
+  const currentAct = await prisma.dailyActivity.findUnique({
+    where: { id: activity.id },
+  });
+  const rec = (currentAct?.recurrence || activity.recurrence) as unknown as {
+    freq?: string;
+    excludeDates?: string[];
+    isException?: boolean;
+  } | null;
+
+  if (!rec || rec.isException) return;
+
+  const excludeDates = Array.isArray(rec.excludeDates)
+    ? rec.excludeDates.filter((d) => typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d.trim()))
+    : [];
+
+  const toRestore = Array.isArray(unexcludedDates)
+    ? unexcludedDates.filter((d) => typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d.trim()))
+    : [];
+
+  if (excludeDates.length === 0 && toRestore.length === 0) return;
+
+  let tokenInfo;
+  try {
+    tokenInfo = await getValidUserToken(userId);
+  } catch {
+    return;
+  }
+  if (!tokenInfo || 'error' in tokenInfo || !tokenInfo.accessToken) return;
+
+  // 1. Batalkan (cancel) instance yang masuk ke excludeDates
+  for (const dateStr of excludeDates) {
+    const trimmed = dateStr.trim();
+    const targetDate = new Date(`${trimmed}T00:00:00Z`);
+    let instanceStart: Date | null = null;
+    if (activity.startTime) {
+      const orig = new Date(activity.startTime);
+      instanceStart = new Date(
+        Date.UTC(
+          targetDate.getUTCFullYear(),
+          targetDate.getUTCMonth(),
+          targetDate.getUTCDate(),
+          orig.getUTCHours(),
+          orig.getUTCMinutes(),
+          orig.getUTCSeconds(),
+        ),
+      );
+    }
+    try {
+      const instance = await findRecurringInstanceForActivity(
+        tokenInfo.accessToken,
+        eventId,
+        targetDate,
+        instanceStart,
+        trimmed,
+      );
+      if (instance && instance.status !== 'cancelled') {
+        await calendarRequest(userId, eventPath(instance.id), { method: 'DELETE' });
+      }
+    } catch {
+      // Abaikan kegagalan instance delete sementara agar sinkronisasi utama tetap sukses
+    }
+  }
+
+  // 2. Pulihkan (restore / un-cancel) instance yang dikeluarkan dari excludeDates (misal saat Undo Ctrl+Z)
+  for (const dateStr of toRestore) {
+    const trimmed = dateStr.trim();
+    const targetDate = new Date(`${trimmed}T00:00:00Z`);
+    let instanceStart: Date | null = null;
+    if (activity.startTime) {
+      const orig = new Date(activity.startTime);
+      instanceStart = new Date(
+        Date.UTC(
+          targetDate.getUTCFullYear(),
+          targetDate.getUTCMonth(),
+          targetDate.getUTCDate(),
+          orig.getUTCHours(),
+          orig.getUTCMinutes(),
+          orig.getUTCSeconds(),
+        ),
+      );
+    }
+    try {
+      const instance = await findRecurringInstanceForActivity(
+        tokenInfo.accessToken,
+        eventId,
+        targetDate,
+        instanceStart,
+        trimmed,
+      );
+      if (instance && instance.status === 'cancelled') {
+        await calendarRequest(userId, eventPath(instance.id), {
+          method: 'PATCH',
+          body: JSON.stringify({ status: 'confirmed' }),
+        });
+      }
+    } catch {
+      // Abaikan kegagalan instance restore sementara agar sinkronisasi utama tetap sukses
+    }
+  }
 }
 
 export async function pushActivityToGoogleCalendar(userId: string, activityId: string) {
@@ -775,7 +901,11 @@ export async function importGoogleEventLocked(
       googleEventId: event.id,
       color: values.color,
       type: 'CUSTOM',
-      recurrence: recurrenceConfig(values.recurrence),
+      recurrence: values.recurrence
+        ? recurrenceConfig(values.recurrence)
+        : event.recurringEventId
+          ? { isException: true }
+          : Prisma.DbNull,
       status: 'PENDING',
     },
     include: { checklistItems: true },

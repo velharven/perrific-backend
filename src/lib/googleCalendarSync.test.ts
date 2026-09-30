@@ -13,8 +13,9 @@ import {
   calendarRequest,
   waitForCalendarBaseline,
   recurrenceDisplayConfig,
+  syncRecurrenceExceptionsLocked,
 } from './googleCalendarSync';
-import type { GoogleCalendarEventItem } from './googleCalendarClient';
+import { type GoogleCalendarEventItem, buildGoogleRecurrenceRule } from './googleCalendarClient';
 import type { Request, Response as ExpressResponse } from 'express';
 import { connect, handleAutoSync } from '../controllers/googleCalendarController';
 import {
@@ -786,3 +787,125 @@ test('a title edit does not shorten a Google all-day event spanning multiple day
   assert.equal((await syncActivityLocked(h.userId, h.id)).pushed, true);
   assert.equal((await h.state()).pending, false);
 });
+
+test('excluding a recurring instance date deletes the instance in Google Calendar and isException creates single event', async () => {
+  const h = await harness();
+  await prisma.dailyActivity.update({
+    where: { id: h.id },
+    data: {
+      recurrence: {
+        freq: 'DAILY',
+        interval: 1,
+        endType: 'NEVER',
+        excludeDates: ['2026-10-06'],
+      },
+    },
+  });
+
+  let deletedInstanceUrl = '';
+  mock.method(globalThis, 'fetch', async (url: unknown, init?: RequestInit) => {
+    const urlStr = String(url);
+    if (urlStr.includes('/instances')) {
+      return response({
+        items: [
+          {
+            id: `${h.remote.id}_20261006T070000Z`,
+            status: 'confirmed',
+            start: { dateTime: '2026-10-06T07:00:00Z' },
+          },
+        ],
+      });
+    }
+    if (init?.method === 'DELETE') {
+      deletedInstanceUrl = urlStr;
+      return response({}, 204);
+    }
+    if (init?.method === 'PATCH') {
+      const payload = JSON.parse(String(init.body));
+      return response({ ...h.remote, ...payload, etag: 'etag-after-exdate' });
+    }
+    return response({ ...h.remote });
+  });
+
+  const act = await prisma.dailyActivity.findUniqueOrThrow({ where: { id: h.id } });
+  await syncRecurrenceExceptionsLocked(h.userId, act, h.remote.id);
+
+  assert.match(deletedInstanceUrl, new RegExp(`${h.remote.id}_20261006T070000Z`));
+  assert.equal(buildGoogleRecurrenceRule({ freq: 'DAILY', isException: true }), null);
+  assert.equal(buildGoogleRecurrenceRule({ isException: true, masterActivityId: 'xyz' }), null);
+});
+
+test('syncing Google Calendar does not overwrite local excludeDates or exception status', async () => {
+  const h = await harness();
+  await prisma.dailyActivity.update({
+    where: { id: h.id },
+    data: {
+      recurrence: {
+        freq: 'DAILY',
+        interval: 1,
+        endType: 'NEVER',
+        excludeDates: ['2026-10-01'],
+      },
+    },
+  });
+
+  mock.method(globalThis, 'fetch', async (_url: unknown, _init?: RequestInit) => {
+    // Google returns RRULE without EXDATE
+    return response({
+      ...h.remote,
+      recurrence: ['RRULE:FREQ=DAILY'],
+      etag: 'etag-google-update',
+      summary: 'Updated from Google',
+    });
+  });
+
+  await syncActivityLocked(h.userId, h.id);
+
+  const updated = await prisma.dailyActivity.findUniqueOrThrow({ where: { id: h.id } });
+  const rec = updated.recurrence as Record<string, unknown>;
+  assert.deepEqual(rec.excludeDates, ['2026-10-01']);
+});
+
+test('restoring an excluded date un-cancels the instance in Google Calendar via PATCH confirmed', async () => {
+  const h = await harness();
+  await prisma.dailyActivity.update({
+    where: { id: h.id },
+    data: {
+      recurrence: {
+        freq: 'DAILY',
+        interval: 1,
+        endType: 'NEVER',
+      },
+    },
+  });
+  let patchedInstanceUrl = '';
+  let patchedBody = '';
+
+  mock.method(globalThis, 'fetch', async (url: unknown, init?: RequestInit) => {
+    const urlStr = String(url);
+    if (urlStr.includes('/instances')) {
+      return response({
+        items: [
+          {
+            id: `${h.remote.id}_20261001T070000Z`,
+            status: 'cancelled',
+            start: { dateTime: '2026-10-01T07:00:00Z' },
+          },
+        ],
+      });
+    }
+    if (init?.method === 'PATCH' && urlStr.includes(`${h.remote.id}_20261001T070000Z`)) {
+      patchedInstanceUrl = urlStr;
+      patchedBody = String(init.body);
+      return response({ status: 'confirmed' });
+    }
+    return response({ ...h.remote });
+  });
+
+  const act = await prisma.dailyActivity.findUniqueOrThrow({ where: { id: h.id } });
+  await syncRecurrenceExceptionsLocked(h.userId, act, h.remote.id, ['2026-10-01']);
+
+  assert.match(patchedInstanceUrl, new RegExp(`${h.remote.id}_20261001T070000Z`));
+  assert.deepEqual(JSON.parse(patchedBody), { status: 'confirmed' });
+});
+

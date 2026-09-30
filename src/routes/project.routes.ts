@@ -7,6 +7,7 @@ const router = Router();
 router.use(authRequired);
 
 router.get('/personal/me', projectController.getMyPersonalProject);
+router.patch('/personal/active', projectController.setActivePersonalProject);
 router.get('/:projectId', projectController.getProject);
 router.patch('/:projectId', projectController.updateProject);
 router.delete('/:projectId', projectController.deleteProject);

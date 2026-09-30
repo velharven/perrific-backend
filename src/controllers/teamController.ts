@@ -463,6 +463,9 @@ export async function createProject(req: Request, res: Response) {
           }
         : {}),
     },
+    include: {
+      columns: { orderBy: { order: 'asc' } },
+    },
   });
   if (!source) {
     // Project baru: kolom + role bawaan + jabatan Member untuk anggota terpilih.

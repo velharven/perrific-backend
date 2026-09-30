@@ -85,9 +85,33 @@ export async function getMyPersonalProject(req: Request, res: Response) {
     await ensureProjectMember(proj.id, req.userId);
   }
 
-  const project = team.projects[0];
+  const user = await prisma.user.findUnique({
+    where: { id: req.userId },
+    select: { activePersonalProjectId: true },
+  });
+  const activeId = user?.activePersonalProjectId;
+  const project = (activeId && team.projects.find((p) => p.id === activeId)) || team.projects[0];
   await ensureProjectMember(project.id, req.userId);
   return res.json({ success: true, data: project });
+}
+
+export async function setActivePersonalProject(req: Request, res: Response) {
+  if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
+  const { projectId } = z.object({ projectId: z.string() }).parse(req.body);
+  const personalTeamId = `personal-${req.userId}`;
+
+  const project = await prisma.project.findFirst({
+    where: { id: projectId, teamId: personalTeamId },
+  });
+  if (!project) return sendError(res, 404, 'Project pribadi tidak ditemukan');
+
+  await prisma.user.update({
+    where: { id: req.userId },
+    data: { activePersonalProjectId: projectId },
+  });
+
+  emitToUser(req.userId, 'personal-project:switched', { projectId });
+  return res.json({ success: true, data: { projectId } });
 }
 
 export async function getProject(req: Request, res: Response) {
@@ -158,6 +182,18 @@ export async function deleteProject(req: Request, res: Response) {
     return sendError(res, 403, 'Hanya admin tim yang bisa menghapus');
   }
   await prisma.project.delete({ where: { id: req.params.projectId } });
+  if (req.userId) {
+    const user = await prisma.user.findUnique({
+      where: { id: req.userId },
+      select: { activePersonalProjectId: true },
+    });
+    if (user?.activePersonalProjectId === req.params.projectId) {
+      await prisma.user.update({
+        where: { id: req.userId },
+        data: { activePersonalProjectId: null },
+      });
+    }
+  }
   await emitToTeamMembers(checked.project.teamId, 'project:updated', {
     teamId: checked.project.teamId,
     projectId: req.params.projectId,
