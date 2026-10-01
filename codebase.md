@@ -21,6 +21,7 @@ purrific-backend/
 │   │   ├── index.ts
 │   │   ├── noteController.ts
 │   │   ├── notificationController.ts
+│   │   ├── organizationController.ts # Manajemen organisasi, tim terhubung, usulan project & task
 │   │   ├── projectController.ts
 │   │   ├── tableController.ts
 │   │   ├── taskController.ts
@@ -50,6 +51,7 @@ purrific-backend/
 │   │   ├── index.ts
 │   │   ├── note.routes.ts
 │   │   ├── notification.routes.ts
+│   │   ├── organization.routes.ts # Rute organisasi, koneksi tim, dan proposal
 │   │   ├── project.routes.ts
 │   │   ├── table.routes.ts
 │   │   ├── task.routes.ts
@@ -92,7 +94,13 @@ Skema basis data dikelola menggunakan Prisma dengan PostgreSQL. Berikut adalah e
 - Table (`tables`): Basis data berbaris dan berkolom yang melekat pada satu Note bertipe TABLE.
 - TableColumn (`table_columns`): Definisi kolom tabel dengan tipe data `TEXT`, `NUMBER`, `SELECT`, `DATE`, atau `CHECKBOX`.
 - TableRow (`table_rows`): Baris data tabel dengan nilai field bertipe JSON. Baris dapat ditautkan ke Note halaman terpisah.
-- Notification (`notifications`): Notifikasi untuk pengguna dengan tipe penugasan, pembaruan tugas, tenggat waktu, atau pengingat aktivitas.
+- Notification (`notifications`): Notifikasi untuk pengguna dengan tipe penugasan (`TASK_ASSIGNED`), pembaruan tugas (`TASK_UPDATED`), tenggat waktu (`DEADLINE_APPROACHING`), terlewat (`TASK_OVERDUE`), pengingat aktivitas (`ACTIVITY_REMINDER`), undangan tim (`TEAM_INVITE`), usulan project (`PROJECT_PROPOSAL`), dan sistem (`SYSTEM`).
+
+### 5. Organisasi dan tata kelola tim lintas divisi
+- Organization (`organizations`): Entitas induk organisasi yang menaungi tim-tim kerja. Memiliki nama, deskripsi, logo avatar, dan pembuat (`createdById`).
+- OrganizationMember (`organization_members`): Tabel keanggotaan pengguna di dalam organisasi dengan peran (`ADMIN` atau `MEMBER`).
+- OrganizationTeam (`organization_teams`): Relasi tim kerja yang terhubung ke dalam organisasi binaan.
+- ProjectProposal (`project_proposals`): Usulan proyek yang diajukan organisasi ke tim binaan dengan status `PENDING`, `APPROVED`, atau `REJECTED`, beserta pencatatan penolakan dan relasi proyek hasil persetujuan (`approvedProjectId`).
 
 ## Sistem autentikasi dan otorisasi
 
@@ -220,11 +228,26 @@ Semua rute diawali dengan prefix `/api`.
 - `GET /tables/:noteId`: Mengambil definisi kolom dan data baris tabel basis data personal.
 - `PUT /tables/:noteId`: Menyimpan pembaruan struktur kolom dan nilai baris pada tabel.
 
+### Organisasi (`/api/organizations`)
+- `GET /`: Mengambil daftar organisasi yang diikuti pengguna.
+- `POST /`: Membuat organisasi baru (pembuat otomatis menjadi admin organisasi).
+- `GET /:id`: Mengambil detail data organisasi, anggota, tim binaan, dan usulan project.
+- `PATCH /:id`: Memperbarui nama, deskripsi, atau logo avatar organisasi (khusus admin).
+- `DELETE /:id`: Menghapus organisasi (khusus admin).
+- `POST /:id/teams`: Menghubungkan tim kerja ke dalam organisasi.
+- `DELETE /:id/teams/:teamId`: Memutuskan hubungan tim dari organisasi.
+- `POST /:id/proposals`: Mengajukan usulan proyek baru ke tim binaan.
+- `POST /:id/send-task`: Mengirimkan tugas ke proyek tim binaan (status menunggu persetujuan).
+- `GET /:id/activities`: Mengambil ringkasan aktivitas proyek se-organisasi.
+- `POST /proposals/:proposalId/approve`: Menyetujui usulan proyek organisasi (khusus admin tim terkait).
+- `POST /proposals/:proposalId/reject`: Menolak usulan proyek organisasi dengan alasan opsional.
+
 ### Dasbor dan notifikasi (`/api/dashboard` dan `/api/notifications`)
 - `GET /dashboard/project/:projectId`: Menghitung metrik progres tugas proyek per kolom.
 - `GET /dashboard/daily`: Menghitung metrik penyelesaian aktivitas harian pengguna untuk hari ini.
-- `GET /notifications`: Mengambil daftar notifikasi pengguna terbaru.
-- `PATCH /notifications/:notificationId/read`: Menandai notifikasi telah dibaca.
+- `GET /notifications`: Mengambil daftar notifikasi pengguna terbaru (mendukung query limit).
+- `PATCH /notifications/:notificationId/read`: Menandai satu notifikasi telah dibaca (memancarkan event socket `notification:read`).
+- `PATCH /notifications/read-all`: Menandai seluruh notifikasi pengguna sebagai telah dibaca (memancarkan event socket `notification:read-all`).
 
 ## Komunikasi real-time dan background scheduler
 
@@ -234,7 +257,14 @@ Inisialisasi Socket.io berada di `src/lib/socket.ts`.
 - Setiap koneksi soket pengguna otomatis bergabung ke ruang terisolasi `user:<userId>`.
 - Ruang terisolasi tim dapat dibentuk menggunakan penamaan `team:<teamId>`.
 - Fungsi pembantu `emitToUser(userId, event, data)` dan `emitToTeam(teamId, event, data)` disediakan untuk menyiarkan event ke client yang relevan tanpa membocorkan data ke pihak lain.
-- Event `calendar:synced` dikirimkan secara terisolasi ke pengguna untuk memicu pembaruan jadwal instan tanpa perlu reload halaman.
+- **Event-event real-time yang didukung**:
+  - `notification:new`: Dikirim ke pengguna spesifik saat ada penugasan tugas baru, usulan task yang perlu persetujuan, persetujuan/penolakan task, permohonan gabung tim, atau usulan organisasi.
+  - `notification:read`: Dikirim ke ruang pengguna saat notifikasi ditandai dibaca untuk sinkronisasi multi-tab/multi-device.
+  - `notification:read-all`: Dikirim ke ruang pengguna saat seluruh notifikasi ditandai dibaca.
+  - `task:assigned`: Mengirim notifikasi penugasan atau perubahan penugasan ke assignee terkait.
+  - `task:updated`: Menyiarkan pembaruan tugas ke seluruh anggota tim.
+  - `team:updated`: Menyiarkan pembaruan data atau anggota tim.
+  - `calendar:synced`: Dikirimkan secara terisolasi ke pengguna untuk memicu pembaruan jadwal instan tanpa perlu reload halaman.
 
 ### Background scheduler
 Penjadwalan tugas latar belakang berada di `src/jobs/scheduler.ts`.
