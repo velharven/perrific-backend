@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { prisma } from './prisma';
-import { createDefaultRoles } from './permissions';
 
 test('Organization workflow: propose project, approve proposal, and send pending task', async () => {
   // 1. Setup User, Team, and Organization

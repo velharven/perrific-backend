@@ -205,14 +205,17 @@ export async function joinTeam(req: Request, res: Response) {
   });
   const targets = [...new Set(admins.map((a) => a.userId))].filter((id) => id !== req.userId);
   if (targets.length > 0) {
-    await prisma.notification.createMany({
-      data: targets.map((userId) => ({
-        userId,
-        type: 'TEAM_INVITE' as const,
-        title: 'Permintaan bergabung baru',
-        message: `${request.user.name} meminta bergabung ke tim "${team.name}".`,
-      })),
-    });
+    for (const userId of targets) {
+      const notif = await prisma.notification.create({
+        data: {
+          userId,
+          type: 'TEAM_INVITE' as const,
+          title: 'Permintaan bergabung baru',
+          message: `${request.user.name} meminta bergabung ke tim "${team.name}".`,
+        },
+      });
+      emitToUser(userId, 'notification:new', notif);
+    }
   }
   return res.status(201).json({ success: true, data: request });
 }
@@ -304,7 +307,7 @@ async function decideJoinRequest(req: Request, res: Response, status: 'APPROVED'
     data: { status, decidedAt: new Date(), decidedById: req.userId },
     include: joinRequestInclude,
   });
-  await prisma.notification.create({
+  const notif = await prisma.notification.create({
     data: {
       userId: jr.userId,
       type: 'TEAM_INVITE',
@@ -315,6 +318,7 @@ async function decideJoinRequest(req: Request, res: Response, status: 'APPROVED'
           : `Permintaanmu bergabung ke tim "${jr.team.name}" ditolak admin.`,
     },
   });
+  emitToUser(jr.userId, 'notification:new', notif);
   if (status === 'APPROVED') {
     await emitToTeamMembers(teamId, 'team:updated', { teamId, action: 'MEMBER_ADDED' }, [jr.userId]);
   }

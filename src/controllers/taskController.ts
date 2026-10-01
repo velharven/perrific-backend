@@ -160,6 +160,18 @@ export async function updateTask(req: Request, res: Response) {
       for (const userId of newIds.filter((id) => !oldIds.includes(id))) {
         logs.push({ kind: 'ASSIGNED', targetUserId: userId });
         emitToUser(userId, 'task:assigned', { taskId: task.id, action: 'ASSIGNED' });
+        if (userId !== actorId) {
+          const notif = await prisma.notification.create({
+            data: {
+              userId,
+              type: 'TASK_ASSIGNED',
+              title: 'Penugasan task baru',
+              message: `Kamu ditugaskan pada task "${task.title}".`,
+              relatedTaskId: task.id,
+            },
+          });
+          emitToUser(userId, 'notification:new', notif);
+        }
       }
       for (const userId of oldIds.filter((id) => !newIds.includes(id))) {
         logs.push({ kind: 'UNASSIGNED', targetUserId: userId });
@@ -463,15 +475,18 @@ async function decideApproval(req: Request, res: Response, approval: 'APPROVED' 
   // Beri tahu assignee saat usulannya disetujui/ditolak.
   const targets = [...new Set(task.assignees.map((a) => a.user.id))].filter((id) => id !== req.userId);
   if (targets.length > 0) {
-    await prisma.notification.createMany({
-      data: targets.map((userId) => ({
-        userId,
-        type: 'TASK_UPDATED' as const,
-        title: approval === 'APPROVED' ? 'Task disetujui' : 'Task ditolak',
-        message: `Task "${task.title}" ${approval === 'APPROVED' ? 'disetujui admin' : 'ditolak admin'}.`,
-        relatedTaskId: task.id,
-      })),
-    });
+    for (const userId of targets) {
+      const notif = await prisma.notification.create({
+        data: {
+          userId,
+          type: 'TASK_UPDATED' as const,
+          title: approval === 'APPROVED' ? 'Task disetujui' : 'Task ditolak',
+          message: `Task "${task.title}" ${approval === 'APPROVED' ? 'disetujui admin' : 'ditolak admin'}.`,
+          relatedTaskId: task.id,
+        },
+      });
+      emitToUser(userId, 'notification:new', notif);
+    }
   }
 
   // Beritahu realtime socket ke seluruh assignee

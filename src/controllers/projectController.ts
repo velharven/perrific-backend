@@ -371,6 +371,18 @@ export async function createTask(req: Request, res: Response) {
   if (approval === 'APPROVED' && initialIds.length > 0) {
     for (const userId of initialIds) {
       emitToUser(userId, 'task:assigned', { taskId: task.id, action: 'ASSIGNED' });
+      if (userId !== req.userId) {
+        const notif = await prisma.notification.create({
+          data: {
+            userId,
+            type: 'TASK_ASSIGNED',
+            title: 'Penugasan task baru',
+            message: `Kamu ditugaskan pada task "${task.title}".`,
+            relatedTaskId: task.id,
+          },
+        });
+        emitToUser(userId, 'notification:new', notif);
+      }
     }
   }
   await emitToTeamMembers(checked.project.teamId, 'task:updated', {
@@ -400,15 +412,18 @@ export async function createTask(req: Request, res: Response) {
       ]),
     ].filter((id) => id !== req.userId);
     if (targets.length > 0) {
-      await prisma.notification.createMany({
-        data: targets.map((userId) => ({
-          userId,
-          type: 'SYSTEM' as const,
-          title: 'Usulan task baru',
-          message: `${proposer?.name ?? 'Anggota tim'} mengusulkan task "${body.title}" dan perlu persetujuan.`,
-          relatedTaskId: task.id,
-        })),
-      });
+      for (const userId of targets) {
+        const notif = await prisma.notification.create({
+          data: {
+            userId,
+            type: 'SYSTEM' as const,
+            title: 'Usulan task baru',
+            message: `${proposer?.name ?? 'Anggota tim'} mengusulkan task "${body.title}" dan perlu persetujuan.`,
+            relatedTaskId: task.id,
+          },
+        });
+        emitToUser(userId, 'notification:new', notif);
+      }
     }
   }
   return res.status(201).json({ success: true, data: withAssignees(task) });

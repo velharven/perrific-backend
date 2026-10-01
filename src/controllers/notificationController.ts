@@ -1,6 +1,7 @@
 import type { Request, Response } from 'express';
 import { prisma } from '../lib/prisma';
 import { sendError } from '../lib/errors';
+import { emitToUser } from '../lib/socket';
 
 // Batas default agar payload tetap kecil; notifikasi lama dibersihkan scheduler.
 const DEFAULT_LIMIT = 50;
@@ -27,5 +28,17 @@ export async function markRead(req: Request, res: Response) {
     where: { id: req.params.notificationId },
     data: { read: true },
   });
+  emitToUser(req.userId, 'notification:read', { notificationId: notification.id });
   return res.json({ success: true, data: notification });
 }
+
+export async function markAllRead(req: Request, res: Response) {
+  if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
+  await prisma.notification.updateMany({
+    where: { userId: req.userId, read: false },
+    data: { read: true },
+  });
+  emitToUser(req.userId, 'notification:read-all', {});
+  return res.json({ success: true, message: 'Semua notifikasi ditandai telah dibaca' });
+}
+

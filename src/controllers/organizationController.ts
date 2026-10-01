@@ -386,7 +386,7 @@ export async function proposeProject(req: Request, res: Response) {
   });
 
   for (const admin of teamAdmins) {
-    await prisma.notification.create({
+    const notif = await prisma.notification.create({
       data: {
         userId: admin.userId,
         type: 'PROJECT_PROPOSAL',
@@ -394,11 +394,7 @@ export async function proposeProject(req: Request, res: Response) {
         message: `Organisasi "${connected.organization.name}" mengusulkan project baru "${body.name}" untuk tim Anda.`,
       },
     });
-    emitToUser(admin.userId, 'notification:new', {
-      type: 'PROJECT_PROPOSAL',
-      title: 'Usulan Project Baru',
-      message: `Organisasi "${connected.organization.name}" mengusulkan project baru "${body.name}".`,
-    });
+    emitToUser(admin.userId, 'notification:new', notif);
   }
 
   return res.status(201).json({ success: true, data: proposal });
@@ -478,7 +474,7 @@ export async function sendTaskToProject(req: Request, res: Response) {
   });
 
   for (const admin of teamAdmins) {
-    await prisma.notification.create({
+    const notif = await prisma.notification.create({
       data: {
         userId: admin.userId,
         type: 'TASK_ASSIGNED',
@@ -486,11 +482,7 @@ export async function sendTaskToProject(req: Request, res: Response) {
         message: `Organisasi "${org.name}" mengirim task "${task.title}" ke project "${project.name}".`,
       },
     });
-    emitToUser(admin.userId, 'notification:new', {
-      type: 'TASK_ASSIGNED',
-      title: 'Task Baru Menunggu Persetujuan',
-      message: `Organisasi "${org.name}" mengirim task "${task.title}" ke project "${project.name}".`,
-    });
+    emitToUser(admin.userId, 'notification:new', notif);
   }
 
   return res.status(201).json({ success: true, data: task });
