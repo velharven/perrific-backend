@@ -337,9 +337,19 @@ export function buildGoogleRecurrenceRule(raw: unknown): string[] | null {
     typeof rec.untilDate === 'string' &&
     rec.untilDate.trim()
   ) {
-    const cleaned = rec.untilDate.trim().replace(/-/g, '').slice(0, 8);
-    if (/^\d{8}$/.test(cleaned)) {
-      parts.push(`UNTIL=${cleaned}T235959Z`);
+    const rawUntil = rec.untilDate.trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(rawUntil)) {
+      // Akhir hari YYYY-MM-DD di zona Asia/Jakarta (23:59:59+07:00) ke UTC = 16:59:59Z
+      const [y, m, d] = rawUntil.split('-').map(Number);
+      const untilUtc = new Date(Date.UTC(y, m - 1, d, 16, 59, 59));
+      const iso = untilUtc.toISOString();
+      const formatted = iso.replace(/[-:]/g, '').slice(0, 15) + 'Z';
+      parts.push(`UNTIL=${formatted}`);
+    } else {
+      const cleaned = rawUntil.replace(/-/g, '').slice(0, 8);
+      if (/^\d{8}$/.test(cleaned)) {
+        parts.push(`UNTIL=${cleaned}T165959Z`);
+      }
     }
   }
 

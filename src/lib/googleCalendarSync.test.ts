@@ -833,6 +833,13 @@ test('excluding a recurring instance date deletes the instance in Google Calenda
   assert.match(deletedInstanceUrl, new RegExp(`${h.remote.id}_20261006T070000Z`));
   assert.equal(buildGoogleRecurrenceRule({ freq: 'DAILY', isException: true }), null);
   assert.equal(buildGoogleRecurrenceRule({ isException: true, masterActivityId: 'xyz' }), null);
+  const ruleUntil = buildGoogleRecurrenceRule({
+    freq: 'WEEKLY',
+    byDays: [3],
+    endType: 'ON_DATE',
+    untilDate: '2026-10-06',
+  });
+  assert.deepEqual(ruleUntil, ['RRULE:FREQ=WEEKLY;BYDAY=WE;UNTIL=20261006T165959Z']);
 });
 
 test('syncing Google Calendar does not overwrite local excludeDates or exception status', async () => {

@@ -849,6 +849,19 @@ export async function importGoogleEventLocked(
   if (event.status === 'cancelled' || !event.start) return null;
   const connectionId = await currentConnectionId(userId);
   if (!connectionId) return null;
+
+  if (event.recurringEventId && !event.recurrence?.length) {
+    const existingMaster = await prisma.dailyActivity.findFirst({
+      where: { userId, calendarConnectionId: connectionId, googleEventId: event.recurringEventId },
+      include: { checklistItems: true },
+    });
+    if (existingMaster) return existingMaster;
+    const master = await readGoogleEvent(userId, event.recurringEventId);
+    if (master && master.status !== 'cancelled' && master.start) {
+      return importGoogleEventLocked(userId, master, knownNew);
+    }
+  }
+
   if (!knownNew) {
     const tombstone = await prisma.calendarSyncState.findFirst({
       where: {
@@ -921,7 +934,118 @@ export async function importGoogleEventLocked(
       googleEtag: event.etag,
     },
   });
+
+  if (values.recurrence && values.recurrence.length > 0) {
+    const looseStates = await prisma.calendarSyncState.findMany({
+      where: {
+        userId,
+        calendarConnectionId: connectionId,
+        recurringEventId: event.id,
+        activityId: { not: activity.id },
+      },
+    });
+    for (const state of looseStates) {
+      await prisma.calendarSyncState.deleteMany({ where: { id: state.id } });
+      await prisma.dailyActivity.deleteMany({
+        where: { id: state.activityId, userId, googleEventId: state.googleEventId },
+      });
+    }
+    const looseActs = await prisma.dailyActivity.findMany({
+      where: {
+        userId,
+        calendarConnectionId: connectionId,
+        id: { not: activity.id },
+        googleEventId: { startsWith: `${event.id}_` },
+      },
+    });
+    for (const act of looseActs) {
+      await prisma.calendarSyncState.deleteMany({ where: { activityId: act.id } });
+      await prisma.dailyActivity.deleteMany({ where: { id: act.id } });
+    }
+  }
+
   return activity;
+}
+
+export async function consolidateLooseGoogleRecurringActivities(userId: string) {
+  const allWithGoogleId = await prisma.dailyActivity.findMany({
+    where: {
+      userId,
+      googleEventId: { not: null },
+    },
+    orderBy: { date: 'asc' },
+  });
+  const looseActivities = allWithGoogleId.filter(
+    (act) => act.googleEventId && act.googleEventId.includes('_'),
+  );
+  if (!looseActivities.length) return;
+
+  const groups = new Map<string, typeof looseActivities>();
+  for (const act of looseActivities) {
+    if (!act.googleEventId) continue;
+    const baseId = act.googleEventId.split('_')[0];
+    if (!baseId) continue;
+    const list = groups.get(baseId) || [];
+    list.push(act);
+    groups.set(baseId, list);
+  }
+
+  for (const [baseId, acts] of groups.entries()) {
+    let masterAct = await prisma.dailyActivity.findFirst({
+      where: {
+        userId,
+        googleEventId: baseId,
+      },
+    });
+
+    let googleMaster: GoogleCalendarEventItem | null = null;
+    try {
+      googleMaster = await readGoogleEvent(userId, baseId);
+    } catch {
+      // Abaikan kegagalan jaringan
+    }
+
+    let parsedRecurrence: Prisma.InputJsonValue | null = null;
+    if (googleMaster?.recurrence?.length) {
+      parsedRecurrence = recurrenceDisplayConfig(googleMaster.recurrence);
+    }
+
+    if (googleMaster && googleMaster.status !== 'cancelled' && googleMaster.start) {
+      if (!masterAct) {
+        masterAct = await importGoogleEventLocked(userId, googleMaster, true);
+      } else if (parsedRecurrence && (!masterAct.recurrence || (masterAct.recurrence as Record<string, unknown>).isException)) {
+        masterAct = await prisma.dailyActivity.update({
+          where: { id: masterAct.id },
+          data: { recurrence: parsedRecurrence },
+        });
+      }
+    } else if (!masterAct && acts.length > 0) {
+      const first = acts[0];
+      const fallbackRec = parsedRecurrence || { freq: 'DAILY', interval: 1, endType: 'NEVER' };
+      masterAct = await prisma.dailyActivity.update({
+        where: { id: first.id },
+        data: {
+          googleEventId: baseId,
+          recurrence: fallbackRec as Prisma.InputJsonValue,
+        },
+      });
+    }
+
+    if (masterAct) {
+      const deleteIds = acts
+        .filter((a) => a.id !== masterAct?.id)
+        .map((a) => a.id);
+
+      if (deleteIds.length > 0) {
+        await prisma.calendarSyncState.deleteMany({
+          where: { activityId: { in: deleteIds } },
+        });
+        await prisma.dailyActivity.deleteMany({
+          where: { id: { in: deleteIds } },
+        });
+      }
+    }
+  }
 }
 
 type SyncResult = {

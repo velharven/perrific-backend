@@ -174,9 +174,9 @@ const createActivitySchema = z.object({
   allDay: z.boolean().optional(),
   type: z.enum(['TASK', 'BREAKDOWN', 'CUSTOM']).default('CUSTOM'),
   status: z.enum(['PENDING', 'COMPLETED', 'SKIPPED']).optional(),
-  taskId: z.string().optional(),
-  icon: z.string().max(8).optional(),
-  order: z.number().optional(),
+  taskId: z.string().nullable().optional(),
+  icon: z.string().max(8).nullable().optional(),
+  order: z.number().nullable().optional(),
   createdAt: z.string().datetime().optional().or(z.string().optional()),
   customValues: z
     .record(z.union([z.string(), z.number(), z.boolean()]))

@@ -32,5 +32,8 @@ router.delete('/:teamId/members/:userId', teamController.removeMember);
 router.get('/:teamId/members', teamController.listMembers);
 router.get('/:teamId/projects', teamController.listProjects);
 router.post('/:teamId/projects', teamController.createProject);
+router.get('/:teamId/project-proposals', teamController.listProjectProposals);
+router.post('/:teamId/project-proposals/:proposalId/approve', teamController.approveProjectProposal);
+router.post('/:teamId/project-proposals/:proposalId/reject', teamController.rejectProjectProposal);
 
 export default router;

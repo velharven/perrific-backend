@@ -519,3 +519,159 @@ export async function createProject(req: Request, res: Response) {
   await emitToTeamMembers(teamId, 'project:updated', { teamId, projectId: project.id, action: 'CREATED' });
   return res.status(201).json({ success: true, data: project });
 }
+
+export async function listProjectProposals(req: Request, res: Response) {
+  if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
+  const { teamId } = req.params;
+
+  const membership = await prisma.teamMember.findFirst({
+    where: { teamId, userId: req.userId },
+  });
+  if (!membership) return sendError(res, 403, 'Bukan anggota tim ini');
+
+  const proposals = await prisma.projectProposal.findMany({
+    where: { teamId },
+    include: {
+      organization: { select: { id: true, name: true, avatarUrl: true } },
+      createdBy: { select: { id: true, name: true, email: true, avatarUrl: true } },
+      decidedBy: { select: { id: true, name: true } },
+      approvedProject: { select: { id: true, name: true } },
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+
+  return res.json({ success: true, data: proposals });
+}
+
+export async function approveProjectProposal(req: Request, res: Response) {
+  if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
+  const { teamId, proposalId } = req.params;
+
+  const membership = await prisma.teamMember.findFirst({
+    where: { teamId, userId: req.userId },
+  });
+  if (!membership) return sendError(res, 403, 'Bukan anggota tim ini');
+  if (membership.role !== 'ADMIN') return sendError(res, 403, 'Hanya admin tim yang dapat menyetujui usulan project');
+
+  const proposal = await prisma.projectProposal.findFirst({
+    where: { id: proposalId, teamId },
+    include: { organization: true, createdBy: true },
+  });
+  if (!proposal) return sendError(res, 404, 'Usulan project tidak ditemukan');
+  if (proposal.status !== 'PENDING') return sendError(res, 400, 'Usulan project sudah diproses sebelumnya');
+
+  const result = await prisma.$transaction(async (tx) => {
+    const project = await tx.project.create({
+      data: {
+        teamId,
+        name: proposal.name,
+        description: proposal.description,
+        columns: {
+          create: [
+            { name: 'To Do', color: '#8A8F98', order: 0 },
+            { name: 'In Progress', color: '#0090FF', order: 1 },
+            { name: 'Done', color: '#46A758', order: 2 },
+          ],
+        },
+      },
+      include: {
+        columns: { orderBy: { order: 'asc' } },
+      },
+    });
+
+    await createDefaultRoles(project.id);
+    const memberRole = await tx.projectRole.findUnique({
+      where: { projectId_name: { projectId: project.id, name: 'Member' } },
+    });
+    const adminRole = await tx.projectRole.findUnique({
+      where: { projectId_name: { projectId: project.id, name: 'Admin' } },
+    });
+
+    if (adminRole) {
+      await tx.projectMember.create({
+        data: { projectId: project.id, userId: req.userId!, roleId: adminRole.id },
+      });
+    }
+    if (memberRole && proposal.createdById !== req.userId) {
+      await tx.projectMember.create({
+        data: { projectId: project.id, userId: proposal.createdById, roleId: memberRole.id },
+      });
+    }
+
+    const updatedProposal = await tx.projectProposal.update({
+      where: { id: proposal.id },
+      data: {
+        status: 'APPROVED',
+        approvedProjectId: project.id,
+        decidedById: req.userId,
+        decidedAt: new Date(),
+      },
+    });
+
+    await tx.notification.create({
+      data: {
+        userId: proposal.createdById,
+        type: 'PROJECT_PROPOSAL',
+        title: 'Usulan Project Disetujui',
+        message: `Usulan project "${proposal.name}" telah disetujui oleh admin tim.`,
+      },
+    });
+
+    return { project, proposal: updatedProposal };
+  });
+
+  emitToUser(proposal.createdById, 'notification:new', {
+    type: 'PROJECT_PROPOSAL',
+    title: 'Usulan Project Disetujui',
+    message: `Usulan project "${proposal.name}" telah disetujui oleh admin tim.`,
+  });
+  await emitToTeamMembers(teamId, 'project:updated', { teamId, projectId: result.project.id, action: 'CREATED' });
+
+  return res.json({ success: true, data: result });
+}
+
+export async function rejectProjectProposal(req: Request, res: Response) {
+  if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
+  const { teamId, proposalId } = req.params;
+  const { reason } = z.object({ reason: z.string().max(500).optional() }).parse(req.body);
+
+  const membership = await prisma.teamMember.findFirst({
+    where: { teamId, userId: req.userId },
+  });
+  if (!membership) return sendError(res, 403, 'Bukan anggota tim ini');
+  if (membership.role !== 'ADMIN') return sendError(res, 403, 'Hanya admin tim yang dapat menolak usulan project');
+
+  const proposal = await prisma.projectProposal.findFirst({
+    where: { id: proposalId, teamId },
+  });
+  if (!proposal) return sendError(res, 404, 'Usulan project tidak ditemukan');
+  if (proposal.status !== 'PENDING') return sendError(res, 400, 'Usulan project sudah diproses sebelumnya');
+
+  const updated = await prisma.projectProposal.update({
+    where: { id: proposal.id },
+    data: {
+      status: 'REJECTED',
+      rejectionReason: reason,
+      decidedById: req.userId,
+      decidedAt: new Date(),
+    },
+  });
+
+  await prisma.notification.create({
+    data: {
+      userId: proposal.createdById,
+      type: 'PROJECT_PROPOSAL',
+      title: 'Usulan Project Ditolak',
+      message: `Usulan project "${proposal.name}" ditolak oleh admin tim.${reason ? ` Alasan: ${reason}` : ''}`,
+    },
+  });
+
+  emitToUser(proposal.createdById, 'notification:new', {
+    type: 'PROJECT_PROPOSAL',
+    title: 'Usulan Project Ditolak',
+    message: `Usulan project "${proposal.name}" ditolak oleh admin tim.`,
+  });
+
+  return res.json({ success: true, data: updated });
+}
+

@@ -16,6 +16,7 @@ import {
   propagatePersonalActivityLocked,
   queueCalendarDeleteLocked,
   flushCalendarDeleteLocked,
+  consolidateLooseGoogleRecurringActivities,
 } from '../lib/googleCalendarSync';
 import { calendarDate } from '../lib/calendarMerge';
 import { Prisma } from '@prisma/client';
@@ -259,6 +260,12 @@ export async function listEvents(req: Request, res: Response) {
     return sendError(res, tokenResult.code, tokenResult.error);
   }
 
+  try {
+    await consolidateLooseGoogleRecurringActivities(req.userId);
+  } catch {
+    // Non-blocking
+  }
+
   const hidden = await prisma.calendarSyncState.findMany({
     where: {
       userId: req.userId,
@@ -385,10 +392,47 @@ export async function handleAutoSync(req: Request, res: Response) {
   }
 }
 
+async function cleanupLooseInstances(
+  userId: string,
+  connectionId: string | null | undefined,
+  masterEventId: string | null | undefined,
+  keepActivityId: string,
+) {
+  if (!connectionId || !masterEventId) return;
+  const looseStates = await prisma.calendarSyncState.findMany({
+    where: {
+      userId,
+      calendarConnectionId: connectionId,
+      recurringEventId: masterEventId,
+      activityId: { not: keepActivityId },
+    },
+  });
+  for (const state of looseStates) {
+    await prisma.calendarSyncState.deleteMany({ where: { id: state.id } });
+    await prisma.dailyActivity.deleteMany({
+      where: { id: state.activityId, userId, googleEventId: state.googleEventId },
+    });
+  }
+
+  const looseActivities = await prisma.dailyActivity.findMany({
+    where: {
+      userId,
+      calendarConnectionId: connectionId,
+      id: { not: keepActivityId },
+      googleEventId: { startsWith: `${masterEventId}_` },
+    },
+  });
+  for (const act of looseActivities) {
+    await prisma.calendarSyncState.deleteMany({ where: { activityId: act.id } });
+    await prisma.dailyActivity.deleteMany({ where: { id: act.id } });
+  }
+}
+
 const importSchema = z.object({
   events: z.array(
     z.object({
       id: z.string().min(1),
+      recurringEventId: z.string().nullable().optional(),
       title: z.string(),
       description: z.string().nullable().optional(),
       start: z.string(),
@@ -404,15 +448,40 @@ export async function importEvents(req: Request, res: Response) {
     const connectionId = await assertConnection(userId, expectedConnection(req));
     let importedCount = 0;
     try {
-      // Read authoritative Google data; client text is not an identity or permission check.
       for (const item of body.events) {
+        const masterEventId =
+          item.recurringEventId || (item.id.includes('_') ? item.id.split('_')[0] : null);
+        const targetGoogleId = masterEventId || item.id;
+
         const existing = await prisma.dailyActivity.findFirst({
-          where: { userId, calendarConnectionId: connectionId, googleEventId: item.id },
+          where: { userId, calendarConnectionId: connectionId, googleEventId: targetGoogleId },
         });
-        if (existing) continue;
-        const event = await readGoogleEvent(userId, item.id);
-        if (event && (await importGoogleEventLocked(userId, event))) importedCount++;
+        if (existing) {
+          if (masterEventId) {
+            await cleanupLooseInstances(userId, connectionId, masterEventId, existing.id);
+          }
+          continue;
+        }
+
+        let event = await readGoogleEvent(userId, targetGoogleId);
+        if (!event && targetGoogleId !== item.id) {
+          event = await readGoogleEvent(userId, item.id);
+        }
+        if (event && (await importGoogleEventLocked(userId, event))) {
+          importedCount++;
+          const finalMasterId =
+            event.recurringEventId || (event.id.includes('_') ? event.id.split('_')[0] : event.id);
+          if (finalMasterId) {
+            const masterAct = await prisma.dailyActivity.findFirst({
+              where: { userId, calendarConnectionId: connectionId, googleEventId: finalMasterId },
+            });
+            if (masterAct) {
+              await cleanupLooseInstances(userId, connectionId, finalMasterId, masterAct.id);
+            }
+          }
+        }
       }
+      await consolidateLooseGoogleRecurringActivities(userId);
       await notifyCalendarChangedLocked(userId, { action: 'import', importedCount });
       return res.json({ success: true, data: { importedCount } });
     } catch (error) {
@@ -429,6 +498,8 @@ const updateEventSchema = z.object({
   endTime: z.string().nullable().optional(),
   recurrence: z.record(z.unknown()).nullable().optional(),
   colorId: z.string().nullable().optional(),
+  scope: z.enum(['THIS_EVENT', 'THIS_AND_FOLLOWING', 'ALL_EVENTS']).optional(),
+  instanceDate: z.string().optional(),
 });
 export async function updateEvent(req: Request, res: Response) {
   if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
@@ -442,11 +513,208 @@ export async function updateEvent(req: Request, res: Response) {
         include: { checklistItems: true },
       });
       if (!activity) {
+        const masterId = req.params.eventId.includes('_') ? req.params.eventId.split('_')[0] : null;
+        if (masterId) {
+          activity = await prisma.dailyActivity.findFirst({
+            where: { userId, calendarConnectionId: connectionId, googleEventId: masterId },
+            include: { checklistItems: true },
+          });
+        }
+      }
+      if (!activity) {
         const event = await readGoogleEvent(userId, req.params.eventId);
         if (!event) return sendError(res, 404, 'Event sudah dihapus dari Google Calendar.');
         activity = await importGoogleEventLocked(userId, event);
       }
       if (!activity) return sendError(res, 404, 'Event tidak tersedia.');
+
+      if (body.scope && activity.recurrence && !(activity.recurrence as Record<string, unknown>).isException) {
+        const rec = activity.recurrence as Record<string, unknown>;
+        const instanceDate = body.instanceDate || (body.date ? calendarDate(body.date) : calendarDate(activity.date));
+
+        if (body.scope === 'THIS_EVENT') {
+          const prevExclude = Array.isArray(rec.excludeDates) ? [...rec.excludeDates] : [];
+          const updatedExclude = [...new Set([...prevExclude, instanceDate])];
+          await prisma.dailyActivity.update({
+            where: { id: activity.id },
+            data: {
+              recurrence: {
+                ...rec,
+                excludeDates: updatedExclude,
+              } as Prisma.InputJsonValue,
+            },
+          });
+          const newStart = body.startTime ? new Date(body.startTime) : null;
+          const newEnd = body.endTime ? new Date(body.endTime) : null;
+          const createdException = await prisma.dailyActivity.create({
+            data: {
+              userId,
+              calendarConnectionId: connectionId,
+              title: body.title !== undefined ? body.title : activity.title,
+              description: body.description !== undefined ? body.description : activity.description,
+              date: new Date(`${calendarDate(body.date || instanceDate)}T00:00:00Z`),
+              startTime: newStart,
+              endTime: newEnd,
+              allDay: !newStart,
+              color: body.colorId !== undefined ? body.colorId : activity.color,
+              type: activity.type,
+              status: activity.status,
+              recurrence: {
+                isException: true,
+                masterActivityId: activity.id,
+              },
+            },
+            include: { checklistItems: true },
+          });
+          await syncActivityLocked(userId, activity.id, undefined, []);
+          await syncActivityLocked(userId, createdException.id);
+          await notifyCalendarChangedLocked(userId, { action: 'update', activityId: activity.id });
+          return res.json({
+            success: true,
+            data: {
+              id: createdException.id,
+              connectionId,
+              activity: createdException,
+            },
+          });
+        }
+
+        const origDateObj = new Date(activity.date || activity.startTime || new Date());
+        const origAnchorStr = calendarDate(origDateObj);
+        const isFirstOccurrence = instanceDate <= origAnchorStr;
+
+        if (body.scope === 'ALL_EVENTS' || (body.scope === 'THIS_AND_FOLLOWING' && isFirstOccurrence)) {
+          const origAnchorDate = new Date(Date.UTC(origDateObj.getUTCFullYear(), origDateObj.getUTCMonth(), origDateObj.getUTCDate()));
+          const targetDateObj = body.date ? new Date(body.date) : origDateObj;
+          const targetMidnight = new Date(Date.UTC(targetDateObj.getUTCFullYear(), targetDateObj.getUTCMonth(), targetDateObj.getUTCDate()));
+          const finalAnchorDate = targetMidnight < origAnchorDate ? targetMidnight : origAnchorDate;
+
+          let newStart: Date | null = null;
+          let newEnd: Date | null = null;
+          if (body.startTime) {
+            const reqStart = new Date(body.startTime);
+            const reqEnd = body.endTime ? new Date(body.endTime) : new Date(reqStart.getTime() + 60 * 60 * 1000);
+            const durMs = reqEnd.getTime() - reqStart.getTime();
+            newStart = new Date(Date.UTC(
+              finalAnchorDate.getUTCFullYear(),
+              finalAnchorDate.getUTCMonth(),
+              finalAnchorDate.getUTCDate(),
+              reqStart.getUTCHours(),
+              reqStart.getUTCMinutes(),
+              reqStart.getUTCSeconds(),
+            ));
+            newEnd = new Date(newStart.getTime() + durMs);
+          }
+
+          let nextRec = { ...rec };
+          const sourceDateObj = new Date(`${instanceDate}T12:00:00Z`);
+          const sourceDay = sourceDateObj.getUTCDay();
+          const targetDay = targetDateObj.getUTCDay();
+          if (nextRec.freq === 'WEEKLY' && sourceDay !== targetDay) {
+            const currentDays = Array.isArray(nextRec.byDays) && nextRec.byDays.length > 0 ? (nextRec.byDays as number[]) : [sourceDay];
+            const updatedDays = currentDays.includes(sourceDay)
+              ? currentDays.map((d) => (d === sourceDay ? targetDay : d))
+              : [...currentDays, targetDay];
+            nextRec.byDays = [...new Set(updatedDays)].sort((a, b) => a - b);
+          }
+
+          const changes = {
+            ...body,
+            date: finalAnchorDate.toISOString(),
+            startTime: newStart?.toISOString(),
+            endTime: newEnd?.toISOString(),
+            recurrence: nextRec,
+            color: body.colorId,
+            ...(body.startTime !== undefined ? { allDay: !body.startTime } : {}),
+          };
+          const fields = changedCalendarFields(changes, activity);
+          await markCalendarChangedLocked(activity, fields);
+          const updated = await prisma.dailyActivity.update({
+            where: { id: activity.id },
+            data: {
+              ...(body.title !== undefined ? { title: body.title } : {}),
+              ...(body.description !== undefined ? { description: body.description } : {}),
+              date: finalAnchorDate,
+              startTime: newStart,
+              endTime: newEnd,
+              allDay: !newStart,
+              recurrence: nextRec as Prisma.InputJsonValue,
+              ...(body.colorId !== undefined ? { color: body.colorId } : {}),
+            },
+          });
+          await propagatePersonalActivityLocked(updated, fields);
+          const result = await syncActivityLocked(userId, activity.id);
+          await notifyCalendarChangedLocked(userId, {
+            action: 'update',
+            activityId: activity.id,
+            eventId: result.googleEventId || req.params.eventId,
+          });
+          return res.json({
+            success: true,
+            data: {
+              id: result.googleEventId || req.params.eventId,
+              connectionId,
+              activity: updated,
+            },
+          });
+        }
+
+        if (body.scope === 'THIS_AND_FOLLOWING') {
+          const instDateObj = new Date(`${instanceDate}T12:00:00Z`);
+          instDateObj.setDate(instDateObj.getDate() - 1);
+          const dayBefore = instDateObj.toISOString().slice(0, 10);
+          const prevExclude = Array.isArray(rec.excludeDates) ? [...rec.excludeDates] : [];
+          const updatedExclude = [...new Set([...prevExclude, instanceDate])];
+          await prisma.dailyActivity.update({
+            where: { id: activity.id },
+            data: {
+              recurrence: {
+                ...rec,
+                endType: 'ON_DATE',
+                untilDate: dayBefore,
+                excludeDates: updatedExclude,
+              } as Prisma.InputJsonValue,
+            },
+          });
+          const nextRec = {
+            ...rec,
+            excludeDates: (Array.isArray(rec.excludeDates) ? rec.excludeDates : []).filter(
+              (d: string) => d > instanceDate,
+            ),
+          };
+          const newStart = body.startTime ? new Date(body.startTime) : null;
+          const newEnd = body.endTime ? new Date(body.endTime) : null;
+          const createdFollowing = await prisma.dailyActivity.create({
+            data: {
+              userId,
+              calendarConnectionId: connectionId,
+              title: body.title !== undefined ? body.title : activity.title,
+              description: body.description !== undefined ? body.description : activity.description,
+              date: new Date(`${calendarDate(body.date || instanceDate)}T00:00:00Z`),
+              startTime: newStart,
+              endTime: newEnd,
+              allDay: !newStart,
+              color: body.colorId !== undefined ? body.colorId : activity.color,
+              type: activity.type,
+              status: activity.status,
+              recurrence: nextRec as Prisma.InputJsonValue,
+            },
+            include: { checklistItems: true },
+          });
+          await syncActivityLocked(userId, activity.id, undefined, []);
+          await syncActivityLocked(userId, createdFollowing.id);
+          await notifyCalendarChangedLocked(userId, { action: 'update', activityId: activity.id });
+          return res.json({
+            success: true,
+            data: {
+              id: createdFollowing.id,
+              connectionId,
+              activity: createdFollowing,
+            },
+          });
+        }
+      }
+
       const changes = {
         ...body,
         color: body.colorId,

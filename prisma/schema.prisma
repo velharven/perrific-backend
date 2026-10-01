@@ -60,6 +60,7 @@ enum NotificationType {
   TASK_OVERDUE
   ACTIVITY_REMINDER
   TEAM_INVITE
+  PROJECT_PROPOSAL
   SYSTEM
 }
 
@@ -111,6 +112,10 @@ model User {
   notifications  Notification[]
   comments       Comment[]
   notes          Note[]
+  createdOrganizations Organization[] @relation("OrgCreator")
+  organizationMembers  OrganizationMember[]
+  createdProposals     ProjectProposal[] @relation("ProposalCreator")
+  decidedProposals     ProjectProposal[] @relation("ProposalDecider")
 
   @@map("users")
 }
@@ -128,6 +133,8 @@ model Team {
   members     TeamMember[]
   projects    Project[]
   joinRequests TeamJoinRequest[]
+  organizationTeams OrganizationTeam[]
+  projectProposals  ProjectProposal[]
 
   @@map("teams")
 }
@@ -183,6 +190,7 @@ model Project {
   columns     BoardColumn[]
   roles       ProjectRole[]
   members     ProjectMember[]
+  projectProposals ProjectProposal[]
 
   @@map("projects")
 }
@@ -200,12 +208,14 @@ model Task {
   dueDate     DateTime?
   order       Float        @default(0) // urutan drag-and-drop dalam kolom (F-04)
   createdById String?      // pembuat task (untuk filter "dibuat oleh"; null = data lama)
+  organizationId String?   // organisasi asal yang mengusulkan/mengirim task
   createdAt   DateTime     @default(now())
   updatedAt   DateTime     @updatedAt
 
   project       Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
   column        BoardColumn     @relation(fields: [columnId], references: [id], onDelete: Restrict)
   createdBy     User?           @relation("TaskCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  organization  Organization?   @relation(fields: [organizationId], references: [id], onDelete: SetNull)
   assignees     TaskAssignee[]
   watchers      TaskWatcher[]
   activities    TaskActivity[]
@@ -217,6 +227,7 @@ model Task {
 
   @@index([projectId])
   @@index([columnId])
+  @@index([organizationId])
   @@unique([projectId, number])
   @@map("tasks")
 }
@@ -602,3 +613,76 @@ model TableRow {
   @@index([tableId, order])
   @@map("table_rows")
 }
+
+model Organization {
+  id          String   @id @default(uuid())
+  name        String
+  description String?
+  avatarUrl   String?
+  createdById String
+  order       Float    @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  createdBy        User                 @relation("OrgCreator", fields: [createdById], references: [id], onDelete: Cascade)
+  members          OrganizationMember[]
+  connectedTeams   OrganizationTeam[]
+  projectProposals ProjectProposal[]
+  tasks            Task[]
+
+  @@map("organizations")
+}
+
+model OrganizationMember {
+  id             String       @id @default(uuid())
+  organizationId String
+  userId         String
+  role           TeamRole     @default(MEMBER)
+  joinedAt       DateTime     @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, userId])
+  @@map("organization_members")
+}
+
+model OrganizationTeam {
+  id             String       @id @default(uuid())
+  organizationId String
+  teamId         String
+  createdAt      DateTime     @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  team           Team         @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, teamId])
+  @@map("organization_teams")
+}
+
+model ProjectProposal {
+  id                String         @id @default(uuid())
+  organizationId    String
+  teamId            String
+  createdById       String
+  name              String
+  description       String?
+  status            ApprovalStatus @default(PENDING)
+  rejectionReason   String?
+  approvedProjectId String?
+  decidedById       String?
+  decidedAt         DateTime?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  organization      Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  team              Team           @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  createdBy         User           @relation("ProposalCreator", fields: [createdById], references: [id], onDelete: Cascade)
+  decidedBy         User?          @relation("ProposalDecider", fields: [decidedById], references: [id], onDelete: SetNull)
+  approvedProject   Project?       @relation(fields: [approvedProjectId], references: [id], onDelete: SetNull)
+
+  @@index([teamId, status])
+  @@index([organizationId])
+  @@map("project_proposals")
+}
+
