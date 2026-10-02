@@ -25,10 +25,9 @@ export function createApp() {
     }),
   );
   app.use(helmet());
-  // 1MB: muat coverUrl dataURL (maks 400rb) + content (maks 100rb).
-  // Default 100KB melempar 413 untuk foto sampul realistis (begitu juga
-  // avatar 300KB yang sudah lebih dulu mengizinkannya di validasi).
-  app.use(express.json({ limit: '1mb' }));
+  // 10MB: mendukung file lampiran hingga 5MB (dataURL base64 ~7MB),
+  // coverUrl, dan avatar tanpa terhalang 413 Payload Too Large.
+  app.use(express.json({ limit: '10mb' }));
   // Limiter global longgar untuk baca/tulis biasa di production; auth tetap ketat di
   // bawah (anti brute-force login) karena limiter ini mencakup semua /api.
   if (env.nodeEnv !== 'development') {
