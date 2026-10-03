@@ -75,6 +75,64 @@ test('connect rejects access token when aud does not match env.googleClientId (c
   }
 });
 
+test('connect rejects access token when issued_to/azp does not match env.googleClientId', async () => {
+  const user = await prisma.user.create({
+    data: {
+      email: `issued-to-mismatch-${randomUUID()}@example.test`,
+      name: 'Issued To Mismatch Victim',
+    },
+  });
+  users.push(user.id);
+
+  const originalClientId = env.googleClientId;
+  (env as { googleClientId: string }).googleClientId = 'correct-purrific-client-id.apps.googleusercontent.com';
+
+  mock.method(globalThis, 'fetch', async (url: unknown) => {
+    const urlStr = String(url);
+    if (urlStr.includes('tokeninfo')) {
+      return new globalThis.Response(
+        JSON.stringify({
+          issued_to: 'attacker-client-id.apps.googleusercontent.com',
+          email: user.email,
+        }),
+        { status: 200 },
+      );
+    }
+    assert.fail(`Unexpected fetch call: ${urlStr}`);
+  });
+
+  let statusCode = 200;
+  let responseBody: any = null;
+  const res = {
+    status: (code: number) => {
+      statusCode = code;
+      return res;
+    },
+    json: (data: any) => {
+      responseBody = data;
+      return res;
+    },
+  } as unknown as Response;
+
+  const req = {
+    userId: user.id,
+    body: {
+      accessToken: 'attacker-issued-to-token',
+    },
+  } as unknown as Request;
+
+  try {
+    await connect(req, res);
+    assert.equal(statusCode, 401);
+    assert.deepEqual(responseBody, {
+      success: false,
+      message: 'Token Google tidak ditujukan untuk aplikasi ini.',
+    });
+  } finally {
+    (env as { googleClientId: string }).googleClientId = originalClientId;
+  }
+});
+
 test('connect accepts access token when aud matches env.googleClientId', async () => {
   const user = await prisma.user.create({
     data: {

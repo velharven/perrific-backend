@@ -212,3 +212,41 @@ test('disconnect proceeds successfully even if Google revoke endpoint throws err
   assert.deepEqual(payloads, [{ success: true, data: { connected: false, connectionId: null } }]);
 });
 
+test('disconnect aborts and does not revoke if expectedConnection mismatches current connection', async () => {
+  const user = await prisma.user.create({
+    data: {
+      email: `calendar-disconnect-mismatch-${randomUUID()}@example.test`,
+      name: 'Disconnect mismatch fixture',
+      googleCalendarConnected: true,
+      googleCalendarConnectionId: 'valid-current-conn-id',
+      googleCalendarRefreshToken: 'active-refresh-token',
+    },
+  });
+  users.push(user.id);
+
+  let fetchCalled = false;
+  mock.method(globalThis, 'fetch', async () => {
+    fetchCalled = true;
+    return new globalThis.Response('{}', { status: 200 });
+  });
+
+  const response = {
+    json: () => response,
+  } as unknown as Response;
+
+  const req = {
+    userId: user.id,
+    get: (header: string) => (header.toLowerCase() === 'x-calendar-connection-id' ? 'stale-connection-id' : undefined),
+  } as unknown as Request;
+
+  await assert.rejects(
+    () => disconnect(req, response),
+    (err: any) => err.code === 409,
+  );
+
+  assert.equal(fetchCalled, false, 'Fetch to revoke endpoint should not have been called');
+
+  const stillConnectedUser = await prisma.user.findUniqueOrThrow({ where: { id: user.id } });
+  assert.equal(stillConnectedUser.googleCalendarConnected, true);
+  assert.equal(stillConnectedUser.googleCalendarRefreshToken, 'active-refresh-token');
+});

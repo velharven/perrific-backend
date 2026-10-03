@@ -38,6 +38,9 @@ import { env } from '../config/env';
 
 interface GoogleTokenInfo {
   aud?: string;
+  audience?: string;
+  issued_to?: string;
+  azp?: string;
   sub?: string;
   email?: string;
   expires_in?: string;
@@ -148,7 +151,8 @@ export async function connect(req: Request, res: Response) {
     }
 
     const tokenInfo = (await tokenInfoRes.json()) as GoogleTokenInfo;
-    if (env.googleClientId && tokenInfo.aud && tokenInfo.aud !== env.googleClientId) {
+    const aud = tokenInfo.aud || (tokenInfo as any).audience || (tokenInfo as any).issued_to || (tokenInfo as any).azp;
+    if (env.googleClientId && aud && aud !== env.googleClientId) {
       return sendError(res, 401, 'Token Google tidak ditujukan untuk aplikasi ini.');
     }
     if (!body.email && tokenInfo.email) {
@@ -237,6 +241,10 @@ export async function connect(req: Request, res: Response) {
 export async function disconnect(req: Request, res: Response) {
   if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
   const userId = req.userId;
+
+  if (expectedConnection(req) !== undefined) {
+    await assertConnection(userId, expectedConnection(req));
+  }
 
   const user = await prisma.user.findUnique({
     where: { id: userId },

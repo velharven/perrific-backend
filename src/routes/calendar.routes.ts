@@ -11,6 +11,7 @@ const calendarLimiter = rateLimit({
   max: 60, // maksimal 60 request per 5 menit
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: (req) => req.userId || req.ip || 'global',
   message: { success: false, message: 'Terlalu banyak permintaan kalender, silakan coba beberapa saat lagi.' },
 });
 
