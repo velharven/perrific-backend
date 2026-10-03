@@ -1,3 +1,4 @@
+import type { Prisma } from '@prisma/client';
 import { prisma } from './prisma';
 
 // Kunci izin project (dicentang per role di tab Role).
@@ -21,7 +22,10 @@ const MEMBER_PERMS = ['task.create', 'task.move'];
 const APPROVER_PERMS = ['task.create', 'task.move', 'task.approve', 'member.approve'];
 
 // Role bawaan tiap project: Admin, Approver, Member + contoh divisi.
-export async function createDefaultRoles(projectId: string) {
+export async function createDefaultRoles(
+  projectId: string,
+  db: Prisma.TransactionClient | typeof prisma = prisma,
+) {
   const defs: { name: string; system: string | null; permissions: string[] }[] = [
     { name: 'Admin', system: 'ADMIN', permissions: ALL_PERMISSIONS },
     { name: 'Approver', system: 'APPROVER', permissions: APPROVER_PERMS },
@@ -31,7 +35,7 @@ export async function createDefaultRoles(projectId: string) {
     { name: 'Design', system: null, permissions: MEMBER_PERMS },
   ];
   for (const d of defs) {
-    await prisma.projectRole.upsert({
+    await db.projectRole.upsert({
       where: { projectId_name: { projectId, name: d.name } },
       update: {},
       create: { projectId, name: d.name, system: d.system, permissions: d.permissions },
@@ -39,13 +43,16 @@ export async function createDefaultRoles(projectId: string) {
   }
 }
 
-async function defaultMemberRoleId(projectId: string): Promise<string | null> {
-  let role = await prisma.projectRole.findUnique({
+async function defaultMemberRoleId(
+  projectId: string,
+  db: Prisma.TransactionClient | typeof prisma = prisma,
+): Promise<string | null> {
+  let role = await db.projectRole.findUnique({
     where: { projectId_name: { projectId, name: 'Member' } },
   });
   if (!role) {
-    await createDefaultRoles(projectId);
-    role = await prisma.projectRole.findUnique({
+    await createDefaultRoles(projectId, db);
+    role = await db.projectRole.findUnique({
       where: { projectId_name: { projectId, name: 'Member' } },
     });
   }

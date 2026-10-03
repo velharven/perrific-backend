@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { prisma } from './prisma';
+import { createDefaultRoles } from './permissions';
 
 test('Organization workflow: propose project, approve proposal, and send pending task', async () => {
   // 1. Setup User, Team, and Organization
@@ -77,6 +78,8 @@ test('Organization workflow: propose project, approve proposal, and send pending
         include: { columns: { orderBy: { order: 'asc' } } },
       });
 
+      await createDefaultRoles(createdProj.id, tx);
+
       await tx.projectProposal.update({
         where: { id: proposal.id },
         data: {
@@ -93,6 +96,11 @@ test('Organization workflow: propose project, approve proposal, and send pending
     assert.ok(project.id);
     assert.equal(project.columns.length, 3);
     assert.equal(project.columns[0].name, 'To Do');
+
+    const createdRoles = await prisma.projectRole.findMany({ where: { projectId: project.id } });
+    assert.ok(createdRoles.length >= 3);
+    assert.ok(createdRoles.some((r) => r.name === 'Admin'));
+    assert.ok(createdRoles.some((r) => r.name === 'Member'));
 
     const updatedProposal = await prisma.projectProposal.findUnique({
       where: { id: proposal.id },

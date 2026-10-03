@@ -583,7 +583,7 @@ export async function approveProjectProposal(req: Request, res: Response) {
       },
     });
 
-    await createDefaultRoles(project.id);
+    await createDefaultRoles(project.id, tx);
     const memberRole = await tx.projectRole.findUnique({
       where: { projectId_name: { projectId: project.id, name: 'Member' } },
     });
