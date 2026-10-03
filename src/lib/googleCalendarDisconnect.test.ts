@@ -6,6 +6,7 @@ import type { Request, Response } from 'express';
 import { disconnect } from '../controllers/googleCalendarController';
 import { withUserCalendarLock } from './calendarOperationLock';
 import { refreshGoogleAccessToken } from './googleCalendarClient';
+import { encryptToken } from './crypto';
 import { prisma } from './prisma';
 
 const users: string[] = [];
@@ -100,7 +101,11 @@ test('a token refresh started before disconnect cannot restore the Google connec
   const requestStarted = new Promise<void>((resolve) => {
     started = resolve;
   });
-  mock.method(globalThis, 'fetch', async () => {
+  mock.method(globalThis, 'fetch', async (input: unknown) => {
+    const urlStr = String(input);
+    if (urlStr.includes('/revoke')) {
+      return new globalThis.Response(JSON.stringify({}), { status: 200 });
+    }
     started();
     return new Promise<globalThis.Response>((resolve) => {
       respond = resolve;
@@ -131,3 +136,79 @@ test('a token refresh started before disconnect cannot restore the Google connec
     else process.env.GOOGLE_CLIENT_SECRET = originalSecret;
   }
 });
+
+test('disconnect calls Google revoke endpoint with decrypted token', async () => {
+  const user = await prisma.user.create({
+    data: {
+      email: `calendar-disconnect-revoke-${randomUUID()}@example.test`,
+      name: 'Disconnect revoke fixture',
+      googleCalendarConnected: true,
+      googleCalendarAccessToken: encryptToken('test-access-token-to-revoke'),
+      googleCalendarRefreshToken: encryptToken('test-refresh-token-to-revoke'),
+    },
+  });
+  users.push(user.id);
+
+  let revokedUrl = '';
+  let revokeMethod = '';
+  let contentType = '';
+  mock.method(globalThis, 'fetch', async (input: unknown, init?: any) => {
+    revokedUrl = String(input);
+    revokeMethod = init?.method || '';
+    const headers = init?.headers as Record<string, string> | undefined;
+    contentType = headers?.['Content-Type'] || '';
+    return new globalThis.Response('{}', { status: 200 });
+  });
+
+  const payloads: unknown[] = [];
+  const response = {
+    json: (value: unknown) => {
+      payloads.push(value);
+      return response;
+    },
+  } as unknown as Response;
+
+  await disconnect({ userId: user.id } as Request, response);
+
+  assert.equal(revokedUrl, 'https://oauth2.googleapis.com/revoke?token=test-refresh-token-to-revoke');
+  assert.equal(revokeMethod, 'POST');
+  assert.equal(contentType, 'application/x-www-form-urlencoded');
+  assert.deepEqual(payloads, [{ success: true, data: { connected: false, connectionId: null } }]);
+
+  const updatedUser = await prisma.user.findUniqueOrThrow({ where: { id: user.id } });
+  assert.equal(updatedUser.googleCalendarConnected, false);
+  assert.equal(updatedUser.googleCalendarRefreshToken, null);
+  assert.equal(updatedUser.googleCalendarAccessToken, null);
+});
+
+test('disconnect proceeds successfully even if Google revoke endpoint throws error', async () => {
+  const user = await prisma.user.create({
+    data: {
+      email: `calendar-disconnect-fail-${randomUUID()}@example.test`,
+      name: 'Disconnect fail fixture',
+      googleCalendarConnected: true,
+      googleCalendarRefreshToken: 'unencrypted-token-to-revoke',
+    },
+  });
+  users.push(user.id);
+
+  mock.method(globalThis, 'fetch', async () => {
+    throw new Error('Network failure');
+  });
+
+  const payloads: unknown[] = [];
+  const response = {
+    json: (value: unknown) => {
+      payloads.push(value);
+      return response;
+    },
+  } as unknown as Response;
+
+  await disconnect({ userId: user.id } as Request, response);
+
+  const updatedUser = await prisma.user.findUniqueOrThrow({ where: { id: user.id } });
+  assert.equal(updatedUser.googleCalendarConnected, false);
+  assert.equal(updatedUser.googleCalendarRefreshToken, null);
+  assert.deepEqual(payloads, [{ success: true, data: { connected: false, connectionId: null } }]);
+});
+

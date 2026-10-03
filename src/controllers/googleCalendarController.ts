@@ -33,7 +33,8 @@ import {
   getValidUserToken,
   type GoogleCalendarEventItem,
 } from '../lib/googleCalendarClient';
-import { encryptToken, isEncryptedToken } from '../lib/crypto';
+import { decryptToken, encryptToken, isEncryptedToken } from '../lib/crypto';
+import { env } from '../config/env';
 
 interface GoogleTokenInfo {
   aud?: string;
@@ -120,8 +121,7 @@ export async function connect(req: Request, res: Response) {
     });
 
     if (!tokenRes.ok) {
-      const errText = await tokenRes.text();
-      console.error('[googleCalendar] Gagal menukar authorization code:', errText);
+      console.error('[googleCalendar] Gagal menukar authorization code (status HTTP:', tokenRes.status, ')');
       return sendError(res, 400, 'Gagal menukarkan kode otorisasi dengan Google.');
     }
 
@@ -148,6 +148,9 @@ export async function connect(req: Request, res: Response) {
     }
 
     const tokenInfo = (await tokenInfoRes.json()) as GoogleTokenInfo;
+    if (env.googleClientId && tokenInfo.aud && tokenInfo.aud !== env.googleClientId) {
+      return sendError(res, 401, 'Token Google tidak ditujukan untuk aplikasi ini.');
+    }
     if (!body.email && tokenInfo.email) {
       body.email = tokenInfo.email;
     }
@@ -234,6 +237,34 @@ export async function connect(req: Request, res: Response) {
 export async function disconnect(req: Request, res: Response) {
   if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
   const userId = req.userId;
+
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { googleCalendarAccessToken: true, googleCalendarRefreshToken: true },
+  });
+
+  const rawToken = user?.googleCalendarRefreshToken || user?.googleCalendarAccessToken;
+  let tokenToRevoke: string | null = null;
+  if (rawToken) {
+    try {
+      tokenToRevoke = decryptToken(rawToken);
+    } catch {
+      tokenToRevoke = null;
+    }
+  }
+
+  if (tokenToRevoke) {
+    try {
+      await fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(tokenToRevoke)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        signal: AbortSignal.timeout(5000),
+      });
+    } catch (revokeErr) {
+      console.warn('[googleCalendar] Peringatan: Gagal mencabut token ke Google Revoke endpoint:', revokeErr);
+    }
+  }
+
   await withUserCalendarLock(userId, async () => {
     if (expectedConnection(req) !== undefined)
       await assertConnection(userId, expectedConnection(req));

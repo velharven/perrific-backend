@@ -18,3 +18,7 @@ export const env = {
   googleClientId: process.env.GOOGLE_CLIENT_ID ?? '',
   calendarEncryptionSecret: process.env.CALENDAR_ENCRYPTION_SECRET ?? '',
 };
+
+if (env.nodeEnv === 'production' && env.jwtSecret === 'change-me') {
+  console.error('[FATAL SECURITY WARNING] JWT_SECRET masih menggunakan nilai default di production!');
+}

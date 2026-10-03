@@ -4,6 +4,7 @@ import { AppError } from '../lib/errors';
 import { CalendarSyncError } from '../lib/calendarConnection';
 import { prisma } from '../lib/prisma';
 import type { TeamRole } from '@prisma/client';
+import { env } from '../config/env';
 
 declare global {
   namespace Express {
@@ -29,7 +30,10 @@ export function errorHandler(err: unknown, _req: Request, res: Response, _next: 
   }
 
   console.error('[error]', err);
-  const message = err instanceof Error ? err.message : 'Terjadi kesalahan pada server';
+  const isDev = env.nodeEnv === 'development';
+  const message = isDev
+    ? (err instanceof Error ? err.message : 'Terjadi kesalahan pada server')
+    : 'Terjadi kesalahan internal pada server';
   return res.status(500).json({ success: false, message });
 }
 
