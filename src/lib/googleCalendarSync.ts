@@ -112,14 +112,69 @@ type ActivityWithChecklist = DailyActivity & {
   checklistItems?: { text: string; completed: boolean }[];
 };
 
+export function calculateRecurrenceStartDayOffset(
+  anchorDateStr: string,
+  rawRecurrence: unknown,
+): number {
+  if (!rawRecurrence || typeof rawRecurrence !== 'object') return 0;
+  const rec = rawRecurrence as {
+    freq?: string;
+    byDays?: number[];
+    isException?: boolean;
+  };
+  if (rec.isException || !rec.freq) return 0;
+
+  const [y, m, d] = anchorDateStr.split('-').map(Number);
+  const anchorDateUtc = new Date(Date.UTC(y, m - 1, d));
+  const dayOfWeek = anchorDateUtc.getUTCDay(); // 0 = Sunday, 1 = Monday, ...
+
+  if (rec.freq === 'WEEKLY' && Array.isArray(rec.byDays) && rec.byDays.length > 0) {
+    const validDays = rec.byDays.filter((val) => Number.isInteger(val) && val >= 0 && val <= 6);
+    if (validDays.length > 0 && !validDays.includes(dayOfWeek)) {
+      for (let offset = 1; offset <= 7; offset++) {
+        if (validDays.includes((dayOfWeek + offset) % 7)) {
+          return offset;
+        }
+      }
+    }
+  }
+
+  return 0;
+}
+
 export function activityCalendarValues(activity: ActivityWithChecklist): CalendarValues {
-  const start = activity.startTime?.toISOString() ?? calendarDate(activity.date);
-  const end = activity.startTime
-    ? (activity.endTime && activity.endTime > activity.startTime
-        ? activity.endTime
-        : new Date(activity.startTime.getTime() + 3600000)
-      ).toISOString()
-    : nextCalendarDate(start);
+  const baseDateStr = calendarDate(activity.startTime ?? activity.date);
+  const offsetDays = calculateRecurrenceStartDayOffset(baseDateStr, activity.recurrence);
+
+  let start: string;
+  let end: string;
+
+  if (offsetDays > 0) {
+    if (activity.startTime) {
+      const shiftedStartTime = new Date(activity.startTime.getTime() + offsetDays * 86400000);
+      const duration =
+        activity.endTime && activity.endTime > activity.startTime
+          ? activity.endTime.getTime() - activity.startTime.getTime()
+          : 3600000;
+      const shiftedEndTime = new Date(shiftedStartTime.getTime() + duration);
+      start = shiftedStartTime.toISOString();
+      end = shiftedEndTime.toISOString();
+    } else {
+      const [y, m, d] = baseDateStr.split('-').map(Number);
+      const shiftedUtc = new Date(Date.UTC(y, m - 1, d + offsetDays));
+      start = shiftedUtc.toISOString().slice(0, 10);
+      end = nextCalendarDate(start);
+    }
+  } else {
+    start = activity.startTime?.toISOString() ?? calendarDate(activity.date);
+    end = activity.startTime
+      ? (activity.endTime && activity.endTime > activity.startTime
+          ? activity.endTime
+          : new Date(activity.startTime.getTime() + 3600000)
+        ).toISOString()
+      : nextCalendarDate(start);
+  }
+
   return {
     title: activity.title,
     description: activity.description || '',

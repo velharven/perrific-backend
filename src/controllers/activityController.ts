@@ -12,7 +12,9 @@ import {
   queueCalendarDeleteLocked,
   flushCalendarDeleteLocked,
   detachCalendarScheduleLocked,
+  calculateRecurrenceStartDayOffset,
 } from '../lib/googleCalendarSync';
+import { calendarDate } from '../lib/calendarMerge';
 import { withUserCalendarLock } from '../lib/calendarOperationLock';
 import {
   assertConnection,
@@ -217,14 +219,34 @@ export async function createActivity(req: Request, res: Response) {
 
     const createdAtDate = parseOptionalDate(body.createdAt);
 
+    let finalDate = date;
+    let finalStartTime = parseOptionalDate(body.startTime) ?? null;
+    let finalEndTime = parseOptionalDate(body.endTime) ?? null;
+
+    if (body.recurrence) {
+      const anchorDateStr = calendarDate(finalStartTime ?? finalDate);
+      const offsetDays = calculateRecurrenceStartDayOffset(anchorDateStr, body.recurrence);
+      if (offsetDays > 0) {
+        finalDate = new Date(finalDate.getTime() + offsetDays * 86400000);
+        if (finalStartTime) {
+          const duration =
+            finalEndTime && finalEndTime > finalStartTime
+              ? finalEndTime.getTime() - finalStartTime.getTime()
+              : 3600000;
+          finalStartTime = new Date(finalStartTime.getTime() + offsetDays * 86400000);
+          finalEndTime = new Date(finalStartTime.getTime() + duration);
+        }
+      }
+    }
+
     const activity = await prisma.dailyActivity.create({
       data: {
         userId,
         title: sourceTask?.title || body.title,
         description: sourceTask ? sourceTask.description : body.description,
-        date,
-        startTime: parseOptionalDate(body.startTime) ?? null,
-        endTime: parseOptionalDate(body.endTime) ?? null,
+        date: finalDate,
+        startTime: finalStartTime,
+        endTime: finalEndTime,
         allDay: body.allDay ?? false,
         type: body.type,
         status: body.status ?? 'PENDING',
@@ -353,6 +375,39 @@ export async function updateActivity(req: Request, res: Response) {
     if (body.endTime !== undefined) {
       const v = body.endTime === null ? null : parseOptionalDate(body.endTime);
       data.endTime = v ?? null;
+    }
+
+    const effectiveRec =
+      body.recurrence !== undefined
+        ? (body.recurrence ? { ...oldRec, ...body.recurrence } : null)
+        : (existing.recurrence as Record<string, unknown> | null);
+
+    if (effectiveRec) {
+      const curDate = (data.date as Date | undefined) ?? existing.date;
+      const curStartTime =
+        data.startTime !== undefined
+          ? (data.startTime as Date | null)
+          : existing.startTime;
+      const curEndTime =
+        data.endTime !== undefined
+          ? (data.endTime as Date | null)
+          : existing.endTime;
+
+      const effectiveStartDate = curStartTime ?? curDate;
+      const anchorDateStr = calendarDate(effectiveStartDate);
+      const offsetDays = calculateRecurrenceStartDayOffset(anchorDateStr, effectiveRec);
+      if (offsetDays > 0) {
+        data.date = new Date(curDate.getTime() + offsetDays * 86400000);
+        if (curStartTime) {
+          const duration =
+            curEndTime && curEndTime > curStartTime
+              ? curEndTime.getTime() - curStartTime.getTime()
+              : 3600000;
+          const shiftedStart = new Date(curStartTime.getTime() + offsetDays * 86400000);
+          data.startTime = shiftedStart;
+          data.endTime = new Date(shiftedStart.getTime() + duration);
+        }
+      }
     }
 
     const activity = await prisma.dailyActivity.update({

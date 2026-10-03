@@ -916,3 +916,75 @@ test('restoring an excluded date un-cancels the instance in Google Calendar via 
   assert.deepEqual(JSON.parse(patchedBody), { status: 'confirmed' });
 });
 
+test('activityCalendarValues shifts start and end to the first recurrence day when Sunday anchor is not in byDays', () => {
+  const sunday = new Date('2026-10-04T10:00:00.000Z'); // Sunday
+  const sundayEnd = new Date('2026-10-04T11:00:00.000Z');
+  const activity: DailyActivity = {
+    id: 'test-sunday-act',
+    userId: 'user-1',
+    title: 'Custom Repeat Act',
+    description: null,
+    date: new Date('2026-10-04T00:00:00.000Z'),
+    startTime: sunday,
+    endTime: sundayEnd,
+    allDay: false,
+    color: null,
+    icon: null,
+    order: 0,
+    status: 'PENDING',
+    type: 'CUSTOM',
+    taskId: null,
+    googleEventId: null,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    customValues: null,
+    recurrence: {
+      freq: 'WEEKLY',
+      interval: 1,
+      byDays: [1, 2, 4, 5],
+      endType: 'NEVER',
+    },
+  };
+
+  const values = activityCalendarValues(activity);
+  assert.equal(values.start, '2026-10-05T10:00:00.000Z');
+  assert.equal(values.end, '2026-10-05T11:00:00.000Z');
+  assert.deepEqual(values.recurrence, ['RRULE:FREQ=WEEKLY;BYDAY=MO,TU,TH,FR']);
+});
+
+test('updateActivity shifts Sunday anchor to Monday when setting weekly recurrence on Mon, Tue, Thu, Fri', async () => {
+  const h = await harness();
+  await prisma.dailyActivity.update({
+    where: { id: h.id },
+    data: {
+      date: new Date('2026-10-04T00:00:00.000Z'),
+      startTime: new Date('2026-10-04T10:00:00.000Z'),
+      endTime: new Date('2026-10-04T11:00:00.000Z'),
+      recurrence: Prisma.DbNull,
+    },
+  });
+
+  const r = controllerResponse();
+  await updateActivity(
+    request(
+      h.userId,
+      h.connectionId,
+      {
+        recurrence: {
+          freq: 'WEEKLY',
+          interval: 1,
+          byDays: [1, 2, 4, 5],
+          endType: 'NEVER',
+        },
+      },
+      { activityId: h.id },
+    ),
+    r.res,
+  );
+
+  const updated = await prisma.dailyActivity.findUniqueOrThrow({ where: { id: h.id } });
+  assert.equal(updated.date.toISOString().slice(0, 10), '2026-10-05');
+  assert.equal(updated.startTime?.toISOString(), '2026-10-05T10:00:00.000Z');
+  assert.equal(updated.endTime?.toISOString(), '2026-10-05T11:00:00.000Z');
+});
+
