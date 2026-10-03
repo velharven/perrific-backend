@@ -33,6 +33,8 @@ import {
   getValidUserToken,
   type GoogleCalendarEventItem,
 } from '../lib/googleCalendarClient';
+import { encryptToken, isEncryptedToken } from '../lib/crypto';
+export { encryptToken, decryptToken, isEncryptedToken } from '../lib/crypto';
 
 interface GoogleTokenInfo {
   aud?: string;
@@ -194,13 +196,21 @@ export async function connect(req: Request, res: Response) {
       (existing.googleCalendarConnectionId === connection.id
         ? existing.googleCalendarRefreshToken
         : null);
+
+    const encryptedAccessToken = accessToken ? encryptToken(accessToken) : null;
+    const encryptedRefreshToken = finalRefreshToken
+      ? isEncryptedToken(finalRefreshToken)
+        ? finalRefreshToken
+        : encryptToken(finalRefreshToken)
+      : null;
+
     await prisma.user.update({
       where: { id: userId },
       data: {
         googleCalendarConnected: true,
         googleCalendarConnectionId: connection.id,
-        googleCalendarAccessToken: accessToken,
-        googleCalendarRefreshToken: finalRefreshToken,
+        googleCalendarAccessToken: encryptedAccessToken,
+        googleCalendarRefreshToken: encryptedRefreshToken,
         googleCalendarTokenExpiresAt: expiresAt,
         googleCalendarEmail: email,
         googleCalendarName: name,

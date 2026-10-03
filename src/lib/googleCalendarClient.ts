@@ -1,5 +1,6 @@
 import { prisma } from './prisma';
 import { assertConnection, currentConnectionId } from './calendarConnection';
+import { encryptToken, decryptToken, isEncryptedToken } from './crypto';
 
 export interface GoogleCalendarEventItem {
   id: string;
@@ -134,10 +135,13 @@ export async function refreshGoogleAccessToken(
   userId: string,
   refreshToken: string,
 ): Promise<string | null> {
-  const key = `${userId}:${refreshToken}`;
+  const plainRefreshToken = isEncryptedToken(refreshToken)
+    ? decryptToken(refreshToken)
+    : refreshToken;
+  const key = `${userId}:${plainRefreshToken}`;
   const current = tokenRefreshes.get(key);
   if (current) return current;
-  const refresh = refreshAccessToken(userId, refreshToken);
+  const refresh = refreshAccessToken(userId, plainRefreshToken);
   tokenRefreshes.set(key, refresh);
   try {
     return await refresh;
@@ -177,7 +181,6 @@ async function refreshAccessToken(userId: string, refreshToken: string): Promise
           where: {
             id: userId,
             googleCalendarConnected: true,
-            googleCalendarRefreshToken: refreshToken,
           },
           data: {
             googleCalendarConnected: false,
@@ -193,14 +196,14 @@ async function refreshAccessToken(userId: string, refreshToken: string): Promise
     const data = (await res.json()) as { access_token: string; expires_in: number };
     const expiresAt = new Date(Date.now() + (data.expires_in || 3600) * 1000);
 
+    const encryptedNewToken = encryptToken(data.access_token);
     const saved = await prisma.user.updateMany({
       where: {
         id: userId,
         googleCalendarConnected: true,
-        googleCalendarRefreshToken: refreshToken,
       },
       data: {
-        googleCalendarAccessToken: data.access_token,
+        googleCalendarAccessToken: encryptedNewToken,
         googleCalendarTokenExpiresAt: expiresAt,
       },
     });
@@ -231,14 +234,44 @@ export async function getValidUserToken(
     return { error: 'Google Calendar belum terhubung.', code: 400 };
   }
 
+  const rawAccessToken = user.googleCalendarAccessToken;
+  const rawRefreshToken = user.googleCalendarRefreshToken;
+
+  const decryptedAccessToken = rawAccessToken ? decryptToken(rawAccessToken) : null;
+  const decryptedRefreshToken = rawRefreshToken ? decryptToken(rawRefreshToken) : null;
+
+  // Transparent Lazy Upgrade: Jika token belum terenkripsi, enkripsi dan simpan secara asinkron
+  if (
+    (rawAccessToken && !isEncryptedToken(rawAccessToken)) ||
+    (rawRefreshToken && !isEncryptedToken(rawRefreshToken))
+  ) {
+    prisma.user
+      .update({
+        where: { id: userId },
+        data: {
+          googleCalendarAccessToken:
+            rawAccessToken && !isEncryptedToken(rawAccessToken)
+              ? encryptToken(decryptedAccessToken!)
+              : undefined,
+          googleCalendarRefreshToken:
+            rawRefreshToken && !isEncryptedToken(rawRefreshToken)
+              ? encryptToken(decryptedRefreshToken!)
+              : undefined,
+        },
+      })
+      .catch((err) => {
+        console.warn('[googleCalendar] Gagal melakukan lazy upgrade enkripsi token:', err);
+      });
+  }
+
   // Cek apakah token sudah kedaluwarsa atau akan kedaluwarsa dalam 5 menit ke depan (300.000 ms)
   const isExpiredOrSoon =
-    !user.googleCalendarAccessToken ||
+    !decryptedAccessToken ||
     (user.googleCalendarTokenExpiresAt &&
       user.googleCalendarTokenExpiresAt.getTime() - Date.now() < 300_000);
 
-  if (isExpiredOrSoon && user.googleCalendarRefreshToken) {
-    const refreshedToken = await refreshGoogleAccessToken(userId, user.googleCalendarRefreshToken);
+  if (isExpiredOrSoon && decryptedRefreshToken) {
+    const refreshedToken = await refreshGoogleAccessToken(userId, decryptedRefreshToken);
     if (refreshedToken) {
       const connectionId = await assertConnection(
         userId,
@@ -255,7 +288,7 @@ export async function getValidUserToken(
       return { error: 'Google Calendar belum terhubung.', code: 400 };
   }
 
-  if (!user.googleCalendarAccessToken) {
+  if (!decryptedAccessToken) {
     return { error: 'Sesi Google Calendar telah kedaluwarsa. Silakan hubungkan ulang.', code: 403 };
   }
 
@@ -265,8 +298,8 @@ export async function getValidUserToken(
     select: { googleCalendarAccessToken: true, googleCalendarConnectionId: true },
   });
   if (
-    latest?.googleCalendarAccessToken !== user.googleCalendarAccessToken ||
-    latest.googleCalendarConnectionId !== connectionId
+    decryptToken(latest?.googleCalendarAccessToken) !== decryptedAccessToken ||
+    latest?.googleCalendarConnectionId !== connectionId
   )
     return { error: 'Akun Google telah berubah. Muat ulang kalender.', code: 409 };
   await assertConnection(
@@ -274,7 +307,7 @@ export async function getValidUserToken(
     expected === undefined ? (user.googleCalendarConnectionId ?? connectionId) : expected,
   );
   if (!connectionId) return { error: 'Google Calendar belum terhubung.', code: 400 };
-  return { accessToken: user.googleCalendarAccessToken, connectionId };
+  return { accessToken: decryptedAccessToken, connectionId };
 }
 
 interface RecurrenceRuleConfig {
