@@ -16,4 +16,5 @@ export const env = {
   jwtExpiresIn: process.env.JWT_EXPIRES_IN ?? '30d',
   bcryptRounds: Number(process.env.BCRYPT_ROUNDS ?? 10),
   googleClientId: process.env.GOOGLE_CLIENT_ID ?? '',
+  calendarEncryptionSecret: process.env.CALENDAR_ENCRYPTION_SECRET ?? '',
 };
