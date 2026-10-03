@@ -34,7 +34,6 @@ import {
   type GoogleCalendarEventItem,
 } from '../lib/googleCalendarClient';
 import { encryptToken, isEncryptedToken } from '../lib/crypto';
-export { encryptToken, decryptToken, isEncryptedToken } from '../lib/crypto';
 
 interface GoogleTokenInfo {
   aud?: string;

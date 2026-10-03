@@ -177,18 +177,33 @@ async function refreshAccessToken(userId: string, refreshToken: string): Promise
       const errText = await res.text();
       console.error('[googleCalendar] refreshGoogleAccessToken gagal:', res.status, errText);
       if (errText.includes('invalid_grant')) {
-        await prisma.user.updateMany({
-          where: {
-            id: userId,
-            googleCalendarConnected: true,
-          },
-          data: {
-            googleCalendarConnected: false,
-            googleCalendarAccessToken: null,
-            googleCalendarRefreshToken: null,
-            googleCalendarTokenExpiresAt: null,
-          },
+        const current = await prisma.user.findUnique({
+          where: { id: userId },
+          select: { googleCalendarRefreshToken: true, googleCalendarConnected: true },
         });
+        if (current?.googleCalendarConnected && current.googleCalendarRefreshToken) {
+          let currentPlainRefresh = '';
+          try {
+            currentPlainRefresh = decryptToken(current.googleCalendarRefreshToken);
+          } catch {
+            // Jika token tidak bisa didekripsi, anggap invalid
+          }
+          if (currentPlainRefresh === refreshToken) {
+            await prisma.user.updateMany({
+              where: {
+                id: userId,
+                googleCalendarConnected: true,
+                googleCalendarRefreshToken: current.googleCalendarRefreshToken,
+              },
+              data: {
+                googleCalendarConnected: false,
+                googleCalendarAccessToken: null,
+                googleCalendarRefreshToken: null,
+                googleCalendarTokenExpiresAt: null,
+              },
+            });
+          }
+        }
       }
       return null;
     }
@@ -237,31 +252,18 @@ export async function getValidUserToken(
   const rawAccessToken = user.googleCalendarAccessToken;
   const rawRefreshToken = user.googleCalendarRefreshToken;
 
-  const decryptedAccessToken = rawAccessToken ? decryptToken(rawAccessToken) : null;
-  const decryptedRefreshToken = rawRefreshToken ? decryptToken(rawRefreshToken) : null;
-
-  // Transparent Lazy Upgrade: Jika token belum terenkripsi, enkripsi dan simpan secara asinkron
-  if (
-    (rawAccessToken && !isEncryptedToken(rawAccessToken)) ||
-    (rawRefreshToken && !isEncryptedToken(rawRefreshToken))
-  ) {
-    prisma.user
-      .update({
-        where: { id: userId },
-        data: {
-          googleCalendarAccessToken:
-            rawAccessToken && !isEncryptedToken(rawAccessToken)
-              ? encryptToken(decryptedAccessToken!)
-              : undefined,
-          googleCalendarRefreshToken:
-            rawRefreshToken && !isEncryptedToken(rawRefreshToken)
-              ? encryptToken(decryptedRefreshToken!)
-              : undefined,
-        },
-      })
-      .catch((err) => {
-        console.warn('[googleCalendar] Gagal melakukan lazy upgrade enkripsi token:', err);
-      });
+  let decryptedAccessToken: string | null = null;
+  let decryptedRefreshToken: string | null = null;
+  try {
+    decryptedAccessToken = rawAccessToken ? decryptToken(rawAccessToken) : null;
+    decryptedRefreshToken = rawRefreshToken ? decryptToken(rawRefreshToken) : null;
+  } catch (err) {
+    console.warn('[googleCalendar] Gagal mendekripsi token:', err);
+    return {
+      error:
+        'Sesi Google Calendar telah kedaluwarsa atau kunci enkripsi berubah. Silakan hubungkan ulang.',
+      code: 403,
+    };
   }
 
   // Cek apakah token sudah kedaluwarsa atau akan kedaluwarsa dalam 5 menit ke depan (300.000 ms)
@@ -269,6 +271,34 @@ export async function getValidUserToken(
     !decryptedAccessToken ||
     (user.googleCalendarTokenExpiresAt &&
       user.googleCalendarTokenExpiresAt.getTime() - Date.now() < 300_000);
+
+  // Transparent Lazy Upgrade: Jangan upgrade access token jika isExpiredOrSoon (karena akan di-refresh dan ditulis terenkripsi oleh refreshAccessToken). Gunakan optimistic concurrency matching.
+  const shouldUpgradeAccess =
+    !isExpiredOrSoon && Boolean(rawAccessToken && !isEncryptedToken(rawAccessToken));
+  const shouldUpgradeRefresh = Boolean(
+    rawRefreshToken && !isEncryptedToken(rawRefreshToken),
+  );
+
+  if (shouldUpgradeAccess || shouldUpgradeRefresh) {
+    prisma.user
+      .updateMany({
+        where: {
+          id: userId,
+          googleCalendarAccessToken: rawAccessToken,
+        },
+        data: {
+          ...(shouldUpgradeAccess
+            ? { googleCalendarAccessToken: encryptToken(decryptedAccessToken!) }
+            : {}),
+          ...(shouldUpgradeRefresh
+            ? { googleCalendarRefreshToken: encryptToken(decryptedRefreshToken!) }
+            : {}),
+        },
+      })
+      .catch((err) => {
+        console.warn('[googleCalendar] Gagal melakukan lazy upgrade enkripsi token:', err);
+      });
+  }
 
   if (isExpiredOrSoon && decryptedRefreshToken) {
     const refreshedToken = await refreshGoogleAccessToken(userId, decryptedRefreshToken);
@@ -297,8 +327,21 @@ export async function getValidUserToken(
     where: { id: userId },
     select: { googleCalendarAccessToken: true, googleCalendarConnectionId: true },
   });
+  let latestDecryptedAccess: string | null = null;
+  try {
+    latestDecryptedAccess = latest?.googleCalendarAccessToken
+      ? decryptToken(latest.googleCalendarAccessToken)
+      : null;
+  } catch {
+    return {
+      error:
+        'Sesi Google Calendar telah kedaluwarsa atau kunci enkripsi berubah. Silakan hubungkan ulang.',
+      code: 403,
+    };
+  }
+
   if (
-    decryptToken(latest?.googleCalendarAccessToken) !== decryptedAccessToken ||
+    latestDecryptedAccess !== decryptedAccessToken ||
     latest?.googleCalendarConnectionId !== connectionId
   )
     return { error: 'Akun Google telah berubah. Muat ulang kalender.', code: 409 };

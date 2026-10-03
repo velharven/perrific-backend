@@ -1,5 +1,6 @@
 import type { Request } from 'express';
 import { prisma } from './prisma';
+import { decryptToken } from './crypto';
 
 export class CalendarSyncError extends Error {
   constructor(
@@ -15,24 +16,37 @@ export async function currentConnectionId(userId: string): Promise<string | null
   const user = await prisma.user.findUnique({ where: { id: userId } });
   if (!user?.googleCalendarConnected) return null;
   if (user.googleCalendarConnectionId) return user.googleCalendarConnectionId;
-  let accessToken = user.googleCalendarAccessToken;
+  const rawAccessToken = user.googleCalendarAccessToken;
+  let plainAccessToken: string | null = null;
+  try {
+    plainAccessToken = rawAccessToken ? decryptToken(rawAccessToken) : null;
+  } catch {
+    return null;
+  }
+
   if (
-    (!accessToken ||
+    (!plainAccessToken ||
       (user.googleCalendarTokenExpiresAt &&
         user.googleCalendarTokenExpiresAt.getTime() - Date.now() < 300000)) &&
     user.googleCalendarRefreshToken
   ) {
     const { refreshGoogleAccessToken } = await import('./googleCalendarClient');
-    accessToken =
-      (await refreshGoogleAccessToken(userId, user.googleCalendarRefreshToken)) || accessToken;
+    plainAccessToken =
+      (await refreshGoogleAccessToken(userId, user.googleCalendarRefreshToken)) || plainAccessToken;
     const latest = await prisma.user.findUnique({ where: { id: userId } });
     if (!latest?.googleCalendarConnected) return null;
     if (latest.googleCalendarConnectionId) return latest.googleCalendarConnectionId;
-    if (latest.googleCalendarAccessToken !== accessToken) return currentConnectionId(userId);
+    let latestPlain: string | null = null;
+    try {
+      latestPlain = latest.googleCalendarAccessToken ? decryptToken(latest.googleCalendarAccessToken) : null;
+    } catch {
+      return null;
+    }
+    if (latestPlain !== plainAccessToken) return currentConnectionId(userId);
   }
-  if (!accessToken) return null;
+  if (!plainAccessToken) return null;
   const response = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-    headers: { Authorization: `Bearer ${accessToken}` },
+    headers: { Authorization: `Bearer ${plainAccessToken}` },
     signal: AbortSignal.timeout(15000),
   });
   if (!response.ok)
@@ -53,12 +67,22 @@ export async function currentConnectionId(userId: string): Promise<string | null
     create: { userId, googleSubject: profile.sub, email: profile.email },
     update: { email: profile.email },
   });
+  const checkLatest = await prisma.user.findUnique({ where: { id: userId } });
+  if (!checkLatest?.googleCalendarConnected) return null;
+  if (checkLatest.googleCalendarConnectionId) return checkLatest.googleCalendarConnectionId;
+  let checkPlain: string | null = null;
+  try {
+    checkPlain = checkLatest.googleCalendarAccessToken ? decryptToken(checkLatest.googleCalendarAccessToken) : null;
+  } catch {
+    return null;
+  }
+  if (checkPlain !== plainAccessToken) return currentConnectionId(userId);
+
   const saved = await prisma.user.updateMany({
     where: {
       id: userId,
       googleCalendarConnected: true,
       googleCalendarConnectionId: null,
-      googleCalendarAccessToken: accessToken,
     },
     data: { googleCalendarConnectionId: connection.id },
   });
