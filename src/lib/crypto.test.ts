@@ -79,7 +79,15 @@ test('isEncryptedToken correctly identifies encrypted tokens and rejects non-enc
   assert.equal(isEncryptedToken('ya29.sample-token'), false);
   assert.equal(isEncryptedToken('1//0g-sample-refresh-token'), false);
   assert.equal(isEncryptedToken(''), false);
+  assert.equal(isEncryptedToken(null), false);
+  assert.equal(isEncryptedToken(undefined), false);
   assert.equal(isEncryptedToken('v1:short'), false);
   assert.equal(isEncryptedToken('v1:part1:part2:part3:extra'), false);
   assert.equal(isEncryptedToken('v2:123456789012345678901234:12345678901234567890123456789012:abcdef'), false);
+});
+
+test('decryptToken gracefully handles null, undefined, and empty string', () => {
+  assert.equal(decryptToken(null), '');
+  assert.equal(decryptToken(undefined), '');
+  assert.equal(decryptToken(''), '');
 });

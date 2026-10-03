@@ -8,19 +8,28 @@ const VERSION_PREFIX = 'v1:';
 
 const HEX_REGEX = /^[0-9a-fA-F]+$/;
 
+let cachedKey: Buffer | null = null;
+let cachedSecret: string | null = null;
+
 /**
  * Derives a 256-bit key from configuration secrets using SHA-256.
+ * Caches the derived key buffer to optimize repeated cryptographic operations.
  */
 function getEncryptionKey(): Buffer {
   const secret = env.calendarEncryptionSecret || env.jwtSecret || 'purrific-default-fallback-key-32b';
-  return crypto.createHash('sha256').update(secret).digest();
+  if (cachedKey && cachedSecret === secret) {
+    return cachedKey;
+  }
+  cachedSecret = secret;
+  cachedKey = crypto.createHash('sha256').update(secret).digest();
+  return cachedKey;
 }
 
 /**
- * Checks whether a given string matches the encrypted format:
+ * Checks whether a given token matches the encrypted format:
  * `v1:<iv_hex>:<authTag_hex>:<ciphertext_hex>`
  */
-export function isEncryptedToken(token: string): boolean {
+export function isEncryptedToken(token: string | null | undefined): boolean {
   if (!token || typeof token !== 'string') {
     return false;
   }
@@ -72,13 +81,14 @@ export function encryptToken(plainText: string): string {
 
 /**
  * Decrypts an AES-256-GCM encrypted token.
+ * If the input is nullish or falsy, returns `cipherText ?? ''`.
  * If the input does not start with `v1:`, it is treated as a legacy plaintext
  * token and returned as-is (transparent fallback).
  * Throws an error if the token has the `v1:` prefix but is malformed or corrupted.
  */
-export function decryptToken(cipherText: string): string {
+export function decryptToken(cipherText: string | null | undefined): string {
   if (!cipherText || typeof cipherText !== 'string' || !cipherText.startsWith(VERSION_PREFIX)) {
-    return cipherText;
+    return cipherText ?? '';
   }
 
   const parts = cipherText.split(':');
