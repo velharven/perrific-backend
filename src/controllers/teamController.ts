@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { prisma } from '../lib/prisma';
 import { sendError } from '../lib/errors';
 import { AVATAR_RE, avatarUrlField } from '../lib/avatar';
-import { randomInviteCode } from '../lib/inviteCode';
+import { randomInviteCode, encryptInviteCode, decryptInviteCode } from '../lib/inviteCode';
 import { assigneesInclude, columnSelect, createdBySelect, withAssignees } from '../lib/taskAssignees';
 import { canAny, createDefaultRoles, ensureProjectMember } from '../lib/permissions';
 import { emitToTeamMembers, emitToUser } from '../lib/socket';
@@ -46,12 +46,12 @@ export async function listMyTeams(req: Request, res: Response) {
   const data = await Promise.all(
     teams.map(async (t) => {
       if (t.members.some((m) => m.userId === req.userId && m.role === 'ADMIN')) {
-        return { ...t, canManageInvite: true };
+        return { ...t, inviteToken: t.inviteCode ? encryptInviteCode(t.inviteCode) : null, canManageInvite: true };
       }
       if (await canAny(req.userId, t.id, 'invite.manage')) {
-        return { ...t, canManageInvite: true };
+        return { ...t, inviteToken: t.inviteCode ? encryptInviteCode(t.inviteCode) : null, canManageInvite: true };
       }
-      return { ...t, inviteCode: null, inviteExpiresAt: null, canManageInvite: false };
+      return { ...t, inviteCode: null, inviteToken: null, inviteExpiresAt: null, canManageInvite: false };
     }),
   );
   return res.json({ success: true, data });
@@ -99,7 +99,10 @@ export async function createTeam(req: Request, res: Response) {
     },
   });
   await emitToTeamMembers(team.id, 'team:updated', { teamId: team.id, action: 'CREATED' });
-  return res.status(201).json({ success: true, data: team });
+  return res.status(201).json({
+    success: true,
+    data: { ...team, inviteToken: team.inviteCode ? encryptInviteCode(team.inviteCode) : null, canManageInvite: true },
+  });
 }
 
 export async function getTeam(req: Request, res: Response) {
@@ -115,11 +118,20 @@ export async function getTeam(req: Request, res: Response) {
     });
     const canInvite =
       membership?.role === 'ADMIN' || (await canAny(req.userId, team.id, 'invite.manage'));
-    if (canInvite) return res.json({ success: true, data: { ...team, canManageInvite: true } });
+    if (canInvite) {
+      return res.json({
+        success: true,
+        data: {
+          ...team,
+          inviteToken: team.inviteCode ? encryptInviteCode(team.inviteCode) : null,
+          canManageInvite: true,
+        },
+      });
+    }
   }
   return res.json({
     success: true,
-    data: { ...team, inviteCode: null, inviteExpiresAt: null, canManageInvite: false },
+    data: { ...team, inviteCode: null, inviteToken: null, inviteExpiresAt: null, canManageInvite: false },
   });
 }
 
@@ -169,15 +181,21 @@ const joinTeamSchema = z.object({
     .string()
     .trim()
     .min(4)
-    .max(16)
-    .transform((s) => s.replace(/\s+/g, '').toUpperCase()),
+    .max(500),
 });
 
 // Masuk tim pakai kode invite: membuat permintaan PENDING yang disetujui admin
 // (tab Persetujuan). Email langsung oleh admin tetap tanpa antre.
 export async function joinTeam(req: Request, res: Response) {
-  const { code } = joinTeamSchema.parse(req.body);
+  const { code: rawCode } = joinTeamSchema.parse(req.body);
   if (!req.userId) return sendError(res, 401, 'Tidak terautentikasi');
+
+  // Dekripsi jika input merupakan token terenkripsi. Jika bukan, normalisasi kode pendek manual
+  const resolved = decryptInviteCode(rawCode);
+  const code = resolved === rawCode
+    ? rawCode.replace(/\s+/g, '').toUpperCase()
+    : resolved;
+
   const team = await prisma.team.findUnique({ where: { inviteCode: code } });
   if (!team) return sendError(res, 404, 'Kode tim tidak ditemukan. Periksa lagi kodenya.');
   if (team.inviteExpiresAt && team.inviteExpiresAt.getTime() <= Date.now()) {
@@ -246,7 +264,14 @@ export async function updateInvite(req: Request, res: Response) {
     include: { members: { include: { user: { select: { id: true, name: true, email: true, avatarUrl: true } } } } },
   }).catch(() => null);
   if (!team) return sendError(res, 404, 'Tim tidak ditemukan');
-  return res.json({ success: true, data: team });
+  return res.json({
+    success: true,
+    data: {
+      ...team,
+      inviteToken: team.inviteCode ? encryptInviteCode(team.inviteCode) : null,
+      canManageInvite: true,
+    },
+  });
 }
 
 const joinRequestUserSelect = { id: true, name: true, email: true, avatarUrl: true } as const;
