@@ -988,3 +988,38 @@ test('updateActivity shifts Sunday anchor to Monday when setting weekly recurren
   assert.equal(updated.endTime?.toISOString(), '2026-10-05T11:00:00.000Z');
 });
 
+test('updateActivity with startTime: null and allDay: false unschedules allDay activity and detaches googleEvent', async () => {
+  const h = await harness();
+  await prisma.dailyActivity.update({
+    where: { id: h.id },
+    data: {
+      allDay: true,
+      startTime: null,
+      endTime: null,
+      googleEventId: h.remote.id,
+    },
+  });
+
+  const r = controllerResponse();
+  await updateActivity(
+    request(
+      h.userId,
+      h.connectionId,
+      {
+        startTime: null,
+        endTime: null,
+        allDay: false,
+        recurrence: null,
+      },
+      { activityId: h.id },
+    ),
+    r.res,
+  );
+
+  const updated = await prisma.dailyActivity.findUniqueOrThrow({ where: { id: h.id } });
+  assert.equal(updated.allDay, false);
+  assert.equal(updated.startTime, null);
+  assert.equal(updated.endTime, null);
+  assert.equal(updated.googleEventId, null);
+});
+

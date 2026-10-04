@@ -334,7 +334,8 @@ export async function updateActivity(req: Request, res: Response) {
 
     const fields = changedCalendarFields(body, existing);
     await markCalendarChangedLocked(existing, fields);
-    const unscheduling = body.startTime === null && !body.allDay && Boolean(existing.startTime);
+    const unscheduling =
+      body.startTime === null && !body.allDay && (Boolean(existing.startTime) || existing.allDay);
     if (unscheduling) await detachCalendarScheduleLocked(existing);
     const data: Record<string, unknown> = {};
     if (body.allDay !== undefined) data.allDay = body.allDay;
