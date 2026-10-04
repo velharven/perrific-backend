@@ -23,6 +23,15 @@ import {
 } from '../lib/calendarConnection';
 
 // ============ Helpers ============
+const activityTaskSelect = {
+  select: {
+    id: true,
+    title: true,
+    priority: true,
+    dueDate: true,
+  },
+};
+
 function parseLocalDate(s: string): Date | null {
   const trimmed = s.trim();
   if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
@@ -134,7 +143,7 @@ export async function listMyActivities(req: Request, res: Response) {
     where: where as never,
     orderBy: [{ order: 'asc' }, { date: 'asc' }, { startTime: 'asc' }, { createdAt: 'asc' }],
     include: {
-      task: { select: { id: true, title: true, priority: true } },
+      task: activityTaskSelect,
       checklistItems: { orderBy: { order: 'asc' } },
     },
     take,
@@ -272,7 +281,7 @@ export async function createActivity(req: Request, res: Response) {
       },
       include: {
         checklistItems: { orderBy: { order: 'asc' } },
-        task: { select: { id: true, title: true } },
+        task: activityTaskSelect,
       },
     });
 
@@ -296,7 +305,7 @@ export async function createActivity(req: Request, res: Response) {
       where: { id: activity.id },
       include: {
         checklistItems: { orderBy: { order: 'asc' } },
-        task: { select: { id: true, title: true } },
+        task: activityTaskSelect,
       },
     });
     return res.status(201).json({ success: true, ...calendarMeta, data: saved });
@@ -416,7 +425,7 @@ export async function updateActivity(req: Request, res: Response) {
       data,
       include: {
         checklistItems: { orderBy: { order: 'asc' } },
-        task: { select: { id: true, title: true } },
+        task: activityTaskSelect,
       },
     });
 
@@ -434,7 +443,7 @@ export async function updateActivity(req: Request, res: Response) {
       where: { id: activity.id },
       include: {
         checklistItems: { orderBy: { order: 'asc' } },
-        task: { select: { id: true, title: true } },
+        task: activityTaskSelect,
       },
     });
     return res.json({ success: true, ...calendarMeta, data: saved });
@@ -639,7 +648,7 @@ export async function duplicateActivity(req: Request, res: Response) {
       },
       include: {
         checklistItems: { orderBy: { order: 'asc' } },
-        task: { select: { id: true, title: true } },
+        task: activityTaskSelect,
       },
     });
 
@@ -923,7 +932,7 @@ export async function setCellValue(req: Request, res: Response) {
     data: { customValues: next as unknown as Prisma.InputJsonValue },
     include: {
       checklistItems: { orderBy: { order: 'asc' } },
-      task: { select: { id: true, title: true } },
+      task: activityTaskSelect,
     },
   });
   return res.json({ success: true, data: updated });
