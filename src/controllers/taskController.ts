@@ -445,6 +445,10 @@ export async function removeWatcher(req: Request, res: Response) {
   return res.json({ success: true, data: { userId: req.params.userId } });
 }
 
+const approveTaskSchema = z.object({
+  assigneeIds: z.array(z.string()).optional(),
+});
+
 // Setujui/tolak usulan task — butuh izin task.approve (role Approver ke atas).
 async function decideApproval(req: Request, res: Response, approval: 'APPROVED' | 'REJECTED') {
   const checked = await requireTaskMembership(req.params.taskId, req.userId);
@@ -461,9 +465,19 @@ async function decideApproval(req: Request, res: Response, approval: 'APPROVED' 
       return sendError(res, 403, 'Hanya approver yang bisa menyetujui task');
     }
   }
+
+  const approveBody = approval === 'APPROVED' ? approveTaskSchema.safeParse(req.body).data : undefined;
+  const updateData: any = { approval };
+  if (approval === 'APPROVED' && approveBody?.assigneeIds !== undefined) {
+    updateData.assignees = {
+      deleteMany: {},
+      create: uniqIds(approveBody.assigneeIds).map((userId) => ({ userId })),
+    };
+  }
+
   const task = await prisma.task.update({
     where: { id: req.params.taskId },
-    data: { approval },
+    data: updateData,
     include: {
       ...assigneesInclude,
       ...watchersInclude,
@@ -472,10 +486,34 @@ async function decideApproval(req: Request, res: Response, approval: 'APPROVED' 
       attachments: { orderBy: { createdAt: 'asc' } },
     },
   });
-  // Beri tahu assignee saat usulannya disetujui/ditolak.
-  const targets = [...new Set(task.assignees.map((a) => a.user.id))].filter((id) => id !== req.userId);
-  if (targets.length > 0) {
-    for (const userId of targets) {
+
+  // Log activity jika ada assignee yang ditugaskan saat approval
+  if (approval === 'APPROVED' && approveBody?.assigneeIds !== undefined && req.userId) {
+    const newIds = uniqIds(approveBody.assigneeIds);
+    if (newIds.length > 0) {
+      await prisma.taskActivity.createMany({
+        data: newIds.map((targetUserId) => ({
+          taskId: task.id,
+          actorId: req.userId!,
+          kind: 'ASSIGNED',
+          targetUserId,
+        })),
+      });
+    }
+  }
+
+  // Beri tahu assignee saat usulannya disetujui/ditolak, serta pengaju usulan (createdBy).
+  const notifyUserIds = new Set<string>();
+  if (task.createdById && task.createdById !== req.userId) {
+    notifyUserIds.add(task.createdById);
+  }
+  for (const a of task.assignees) {
+    if (a.user.id !== req.userId) {
+      notifyUserIds.add(a.user.id);
+    }
+  }
+  if (notifyUserIds.size > 0) {
+    for (const userId of notifyUserIds) {
       const notif = await prisma.notification.create({
         data: {
           userId,
