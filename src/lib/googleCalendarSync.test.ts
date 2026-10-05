@@ -21,6 +21,7 @@ import { connect, handleAutoSync } from '../controllers/googleCalendarController
 import {
   listMyActivities,
   updateActivity,
+  deleteActivity,
   addChecklistItem,
   updateChecklistItem,
 } from '../controllers/activityController';
@@ -1021,5 +1022,101 @@ test('updateActivity with startTime: null and allDay: false unschedules allDay a
   assert.equal(updated.startTime, null);
   assert.equal(updated.endTime, null);
   assert.equal(updated.googleEventId, null);
+});
+
+test('deleteActivity cascade deletes child exception activities belonging to master activity', async () => {
+  const h = await harness();
+  await prisma.dailyActivity.update({
+    where: { id: h.id },
+    data: {
+      recurrence: {
+        freq: 'DAILY',
+        interval: 1,
+        excludeDates: ['2026-10-06'],
+      },
+    },
+  });
+
+  const childException = await prisma.dailyActivity.create({
+    data: {
+      userId: h.userId,
+      calendarConnectionId: h.connectionId,
+      title: 'Exception Instance',
+      date: new Date('2026-10-06T00:00:00Z'),
+      startTime: new Date('2026-10-06T14:00:00Z'),
+      endTime: new Date('2026-10-06T15:00:00Z'),
+      allDay: false,
+      type: 'CUSTOM',
+      recurrence: {
+        isException: true,
+        masterActivityId: h.id,
+      },
+    },
+  });
+
+  const r = controllerResponse();
+  await deleteActivity(
+    request(h.userId, h.connectionId, {}, { activityId: h.id }),
+    r.res,
+  );
+
+  const masterAfter = await prisma.dailyActivity.findUnique({ where: { id: h.id } });
+  const childAfter = await prisma.dailyActivity.findUnique({ where: { id: childException.id } });
+  assert.equal(masterAfter, null);
+  assert.equal(childAfter, null);
+});
+
+test('updateActivity with recurrence: null and startTime: null cascade deletes child exception activities', async () => {
+  const h = await harness();
+  await prisma.dailyActivity.update({
+    where: { id: h.id },
+    data: {
+      recurrence: {
+        freq: 'DAILY',
+        interval: 1,
+        excludeDates: ['2026-10-06'],
+      },
+    },
+  });
+
+  const childException = await prisma.dailyActivity.create({
+    data: {
+      userId: h.userId,
+      calendarConnectionId: h.connectionId,
+      title: 'Exception Instance',
+      date: new Date('2026-10-06T00:00:00Z'),
+      startTime: new Date('2026-10-06T14:00:00Z'),
+      endTime: new Date('2026-10-06T15:00:00Z'),
+      allDay: false,
+      type: 'CUSTOM',
+      recurrence: {
+        isException: true,
+        masterActivityId: h.id,
+      },
+    },
+  });
+
+  const r = controllerResponse();
+  await updateActivity(
+    request(
+      h.userId,
+      h.connectionId,
+      {
+        startTime: null,
+        endTime: null,
+        allDay: false,
+        recurrence: null,
+      },
+      { activityId: h.id },
+    ),
+    r.res,
+  );
+
+  const masterAfter = await prisma.dailyActivity.findUniqueOrThrow({ where: { id: h.id } });
+  assert.equal(masterAfter.recurrence, null);
+  assert.equal(masterAfter.startTime, null);
+
+  const childAfter = await prisma.dailyActivity.findUnique({ where: { id: childException.id } });
+  assert.equal(childAfter, null);
 });
 

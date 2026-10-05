@@ -607,6 +607,67 @@ export async function deletePersonalTaskSchedulesLocked(userId: string, taskId: 
   }
 }
 
+export async function findChildExceptionActivitiesLocked(
+  userId: string,
+  masterActivity: { id: string; googleEventId?: string | null },
+): Promise<DailyActivity[]> {
+  try {
+    const candidates = await prisma.dailyActivity.findMany({
+      where: {
+        userId,
+        OR: [
+          {
+            recurrence: {
+              path: ['masterActivityId'],
+              equals: masterActivity.id,
+            },
+          },
+          ...(masterActivity.googleEventId
+            ? [
+                {
+                  googleEventId: {
+                    startsWith: `${masterActivity.googleEventId}_`,
+                  },
+                },
+              ]
+            : []),
+        ],
+      },
+    });
+    return candidates.filter((a) => a.id !== masterActivity.id);
+  } catch {
+    const all = await prisma.dailyActivity.findMany({ where: { userId } });
+    return all.filter((a) => {
+      if (a.id === masterActivity.id) return false;
+      const rec = a.recurrence as Record<string, unknown> | null;
+      const matchesMasterId = Boolean(rec && rec.isException && rec.masterActivityId === masterActivity.id);
+      const matchesGooglePrefix = Boolean(
+        masterActivity.googleEventId &&
+        a.googleEventId &&
+        a.googleEventId.startsWith(`${masterActivity.googleEventId}_`),
+      );
+      return matchesMasterId || matchesGooglePrefix;
+    });
+  }
+}
+
+export async function cascadeDeleteChildExceptionsLocked(
+  userId: string,
+  masterActivity: { id: string; googleEventId?: string | null },
+) {
+  const childExceptions = await findChildExceptionActivitiesLocked(userId, masterActivity);
+  for (const child of childExceptions) {
+    await queueCalendarDeleteLocked(child);
+    await flushCalendarDeleteLocked(userId, child.id);
+    await notifyCalendarChangedLocked(userId, {
+      action: 'delete',
+      activityId: child.id,
+      googleEventId: child.googleEventId,
+    });
+  }
+  return childExceptions;
+}
+
 interface SyncOneResult {
   googleEventId: string | null;
   updated: boolean;
@@ -663,6 +724,7 @@ export async function syncActivityLocked(
     if (remote?.status === 'cancelled') remote = null;
     if (!remote && (activity.googleEventId || baseline)) {
       if (activity.googleEventId) {
+        await cascadeDeleteChildExceptionsLocked(userId, activity);
         await queueCalendarDeleteLocked(activity);
         await prisma.calendarSyncState.update({
           where: { id: state.id },

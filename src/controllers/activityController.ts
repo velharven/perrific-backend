@@ -13,6 +13,7 @@ import {
   flushCalendarDeleteLocked,
   detachCalendarScheduleLocked,
   calculateRecurrenceStartDayOffset,
+  cascadeDeleteChildExceptionsLocked,
 } from '../lib/googleCalendarSync';
 import { calendarDate } from '../lib/calendarMerge';
 import { withUserCalendarLock } from '../lib/calendarOperationLock';
@@ -346,6 +347,9 @@ export async function updateActivity(req: Request, res: Response) {
     const unscheduling =
       body.startTime === null && !body.allDay && (Boolean(existing.startTime) || existing.allDay);
     if (unscheduling) await detachCalendarScheduleLocked(existing);
+    if (unscheduling || (body.recurrence === null && existing.recurrence !== null)) {
+      await cascadeDeleteChildExceptionsLocked(userId, existing);
+    }
     const data: Record<string, unknown> = {};
     if (body.allDay !== undefined) data.allDay = body.allDay;
     if (unscheduling) data.googleEventId = null;
@@ -463,6 +467,7 @@ export async function deleteActivity(req: Request, res: Response) {
     });
     if (!existing) return sendError(res, 404, 'Aktivitas tidak ditemukan');
 
+    await cascadeDeleteChildExceptionsLocked(userId, existing);
     await queueCalendarDeleteLocked(existing);
     await flushCalendarDeleteLocked(userId, existing.id);
     const calendarMeta = await notifyCalendarChangedLocked(userId, {
